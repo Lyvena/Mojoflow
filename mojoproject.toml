@@ -1,0 +1,12 @@
+[project]
+name = "mojoflow"
+version = "0.1.0"
+description = "AI-Native Full-Stack Framework for Mojo"
+license = "Apache-2.0"
+authors = ["Lyvena"]
+
+[dependencies]
+
+[tool.mojoflow]
+default-port = 8080
+log-level = "info"

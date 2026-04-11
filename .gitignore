@@ -1,0 +1,25 @@
+# Mojo build artifacts
+__pycache__/
+*.pyc
+*.mojopkg
+build/
+dist/
+.mojo_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+*.key
+
+# Generated UI output
+ui_output/
