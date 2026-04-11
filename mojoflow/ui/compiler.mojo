@@ -38,8 +38,13 @@ struct UICompiler:
     # ── HTML Compilation ──────────────────────────────────────────
 
     fn compile_to_html(self, root: UINode) -> String:
-        """Compile a UINode tree into a complete HTML document."""
+        """Compile a UINode tree into a complete HTML document.
+
+        Event handlers are compiled into inline JavaScript.
+        API call patterns (call_api) are converted to fetch() calls.
+        """
         var body = self._render_html_node(root, 2)
+        var scripts = self._collect_event_scripts(root)
         var html = "<!DOCTYPE html>\n"
         html += "<html lang=\"en\">\n"
         html += "<head>\n"
@@ -49,6 +54,8 @@ struct UICompiler:
         html += "</head>\n"
         html += "<body>\n"
         html += body
+        if scripts != "":
+            html += "  <script>\n" + scripts + "  </script>\n"
         html += "</body>\n"
         html += "</html>\n"
         return html
@@ -107,11 +114,38 @@ struct UICompiler:
     # ── React/JSX Compilation ─────────────────────────────────────
 
     fn compile_to_react(self, root: UINode) -> String:
-        """Compile a UINode tree into a React functional component."""
-        var jsx_body = self._render_jsx_node(root, 2)
+        """Compile a UINode tree into a React functional component.
 
-        var output = "import React from 'react';\n\n"
+        Automatically adds useState import if any event handlers with
+        API calls are detected, and generates state + handler functions.
+        """
+        var jsx_body = self._render_jsx_node(root, 2)
+        var has_api_calls = self._has_api_calls(root)
+
+        var output = String("")
+        if has_api_calls:
+            output += "import React, { useState } from 'react';\n\n"
+        else:
+            output += "import React from 'react';\n\n"
+
         output += "export default function " + self.component_name + "() {\n"
+
+        if has_api_calls:
+            output += "  const [data, setData] = useState(null);\n"
+            output += "  const [loading, setLoading] = useState(false);\n\n"
+            output += "  const callApi = async (path) => {\n"
+            output += "    setLoading(true);\n"
+            output += "    try {\n"
+            output += "      const res = await fetch(path);\n"
+            output += "      const json = await res.json();\n"
+            output += "      setData(json);\n"
+            output += "    } catch (err) {\n"
+            output += "      console.error('API error:', err);\n"
+            output += "    } finally {\n"
+            output += "      setLoading(false);\n"
+            output += "    }\n"
+            output += "  };\n\n"
+
         output += "  return (\n"
         output += jsx_body
         output += "  );\n"
@@ -168,6 +202,46 @@ struct UICompiler:
         for _ in range(depth * self.indent_size):
             result += " "
         return result
+
+    fn _collect_event_scripts(self, node: UINode) -> String:
+        """Collect event handlers from the tree and generate JavaScript."""
+        var scripts = String("")
+        var counter = 0
+        scripts += self._collect_events_recursive(node, counter)
+        return scripts
+
+    fn _collect_events_recursive(self, node: UINode, inout counter: Int) -> String:
+        """Recursively collect event handler scripts from the node tree."""
+        var scripts = String("")
+        for i in range(len(node.props)):
+            var prop = node.props[i]
+            if prop.is_event_handler():
+                if prop.is_api_call():
+                    var path = prop._extract_api_path()
+                    scripts += (
+                        "    function handleEvent"
+                        + String(counter)
+                        + "() {\n"
+                    )
+                    scripts += "      fetch('" + path + "')\n"
+                    scripts += "        .then(r => r.json())\n"
+                    scripts += "        .then(data => console.log(data))\n"
+                    scripts += "        .catch(err => console.error(err));\n"
+                    scripts += "    }\n"
+                    counter += 1
+        for i in range(len(node.children)):
+            scripts += self._collect_events_recursive(node.children[i], counter)
+        return scripts
+
+    fn _has_api_calls(self, node: UINode) -> Bool:
+        """Check if any node in the tree has API call event handlers."""
+        for i in range(len(node.props)):
+            if node.props[i].is_api_call():
+                return True
+        for i in range(len(node.children)):
+            if self._has_api_calls(node.children[i]):
+                return True
+        return False
 
     fn compile(self, root: UINode, target: String) -> String:
         """Compile to the specified target format."""

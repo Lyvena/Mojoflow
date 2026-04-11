@@ -108,10 +108,17 @@ struct Agent:
             var content = response.content
             self.history.append(content)
 
-            # Check if agent wants to continue
-            if content[:9] == "CONTINUE:":
+            # Check if agent wants to continue (safe length check first)
+            var trimmed = content.strip()
+            var wants_continue = False
+            if len(trimmed) >= 9:
+                var prefix = trimmed[:9].upper()
+                if prefix == "CONTINUE:":
+                    wants_continue = True
+
+            if wants_continue:
                 # Agent wants another iteration
-                var reasoning = content[9:]
+                var reasoning = trimmed[9:].strip()
                 current_prompt = (
                     "Previous reasoning: "
                     + reasoning

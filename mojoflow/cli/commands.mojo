@@ -81,47 +81,71 @@ struct CreateCommand:
 
     fn _write_api_template(self, base: String) raises:
         """Generate a basic API template."""
-        var code = (
-            'from mojoflow.server import App\n'
-            + "from mojoflow.core import Config\n\n"
-            + "fn main() raises:\n"
-            + "    var config = Config(app_name=\""
-            + self.project_name
-            + '")\n'
-            + "    var app = App(config)\n\n"
-            + "    app.use_middleware(\"logging\")\n"
-            + "    app.use_middleware(\"cors\")\n\n"
-            + '    app.get("/", \'{"status": "ok", "app": "'
-            + self.project_name
-            + "\"}')\\n"
-            + '    app.get("/hello", \'{"message": "Hello from '
-            + self.project_name
-            + "!\"}')\\n\\n"
-            + "    app.listen(8080)\\n"
-        )
+        var lines = List[String]()
+        lines.append("from mojoflow.server.http import App")
+        lines.append("from mojoflow.core.config import Config")
+        lines.append("from mojoflow.core.json import JsonBuilder")
+        lines.append("")
+        lines.append("")
+        lines.append("fn main() raises:")
+        lines.append('    var config = Config(app_name="' + self.project_name + '")')
+        lines.append("    var app = App(config)")
+        lines.append("")
+        lines.append('    app.use_middleware("logging")')
+        lines.append('    app.use_middleware("cors")')
+        lines.append("")
+        lines.append('    # Build JSON responses safely')
+        lines.append("    var status_json = JsonBuilder()")
+        lines.append('    status_json.add_string("status", "ok")')
+        lines.append('    status_json.add_string("app", "' + self.project_name + '")')
+        lines.append("")
+        lines.append("    var hello_json = JsonBuilder()")
+        lines.append('    hello_json.add_string("message", "Hello from ' + self.project_name + '!")')
+        lines.append("")
+        lines.append('    app.get("/", status_json.build())')
+        lines.append('    app.get("/hello", hello_json.build())')
+        lines.append("")
+        lines.append("    app.listen(8080)")
+        lines.append("")
+
+        var code = String("")
+        for i in range(len(lines)):
+            code += lines[i] + "\n"
         self._write_file(base + "/main.mojo", code)
 
     fn _write_ai_template(self, base: String) raises:
         """Generate an AI app template."""
-        var code = (
-            "from mojoflow.server import App\n"
-            + "from mojoflow.ai import LLMClient\n"
-            + "from mojoflow.core import Config\n\n"
-            + "fn main() raises:\n"
-            + '    var config = Config(app_name="'
-            + self.project_name
-            + '")\n'
-            + "    var app = App(config)\n"
-            + '    var llm = LLMClient(provider="openai", model="gpt-4")\n\n'
-            + "    app.use_middleware(\"logging\")\n\n"
-            + '    app.get("/", \'{"status": "ok", "app": "'
-            + self.project_name
-            + "\"}')\\n"
-            + '    app.get("/ask", \'{"info": "POST a prompt to /ask"}\')\n\n'
-            + "    # AI endpoint would use LLM client\n"
-            + "    # var response = llm.complete(prompt)\n\n"
-            + "    app.listen(8080)\n"
-        )
+        var lines = List[String]()
+        lines.append("from mojoflow.server.http import App")
+        lines.append("from mojoflow.ai.llm import LLMClient")
+        lines.append("from mojoflow.core.config import Config")
+        lines.append("from mojoflow.core.json import JsonBuilder")
+        lines.append("")
+        lines.append("")
+        lines.append("fn main() raises:")
+        lines.append('    var config = Config(app_name="' + self.project_name + '")')
+        lines.append("    var app = App(config)")
+        lines.append('    var llm = LLMClient(provider="openai", model="gpt-4")')
+        lines.append("")
+        lines.append('    app.use_middleware("logging")')
+        lines.append('    app.use_middleware("cors")')
+        lines.append("")
+        lines.append("    var status_json = JsonBuilder()")
+        lines.append('    status_json.add_string("status", "ok")')
+        lines.append('    status_json.add_string("app", "' + self.project_name + '")')
+        lines.append("")
+        lines.append('    app.get("/", status_json.build())')
+        lines.append('    app.get("/ask", \'{"info": "POST a prompt to /ask"}\')')
+        lines.append("")
+        lines.append("    # AI endpoint would use LLM client:")
+        lines.append("    # var response = llm.complete(prompt)")
+        lines.append("")
+        lines.append("    app.listen(8080)")
+        lines.append("")
+
+        var code = String("")
+        for i in range(len(lines)):
+            code += lines[i] + "\n"
         self._write_file(base + "/main.mojo", code)
 
     fn _write_file(self, path: String, content: String) raises:

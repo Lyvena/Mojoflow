@@ -16,10 +16,13 @@ Run:
     mojo run examples/ai_app/main.mojo
 """
 
-from mojoflow.server import App
-from mojoflow.ai import LLMClient, Agent, AgentConfig, PromptTemplate, PromptRegistry
-from mojoflow.ai import Task, Pipeline, Orchestrator
-from mojoflow.core import Config
+from mojoflow.server.http import App
+from mojoflow.ai.llm import LLMClient, RetryPolicy
+from mojoflow.ai.agent import Agent, AgentConfig
+from mojoflow.ai.prompt import PromptTemplate, PromptRegistry
+from mojoflow.ai.orchestrator import Task, Pipeline, Orchestrator
+from mojoflow.core.config import Config
+from mojoflow.core.json import JsonBuilder
 from mojoflow.core.types import KeyValue
 
 
@@ -27,11 +30,13 @@ fn demo_llm_client() raises:
     """Demonstrate basic LLM completion."""
     print("\n=== LLM Client Demo ===\n")
 
+    # LLM client with retry policy for resilience
     var client = LLMClient(
         provider="openai",
         model="gpt-4",
         temperature=0.7,
         max_tokens=256,
+        retry_policy=RetryPolicy(max_retries=2, base_delay_seconds=1.0),
     )
 
     var response = client.complete("Explain what Mojo programming language is in 2 sentences.")
@@ -172,9 +177,19 @@ fn main() raises:
     app.use_middleware("logging")
     app.use_middleware("cors")
 
-    app.get("/", '{"name": "AI App", "version": "0.1.0"}')
-    app.get("/ask", '{"info": "Send POST to /ask with a JSON body containing a prompt field"}')
-    app.post("/ask", '{"response": "AI response placeholder — connect LLM client for live results"}')
+    var info_json = JsonBuilder()
+    info_json.add_string("name", "AI App")
+    info_json.add_string("version", "0.2.0")
+
+    var ask_info_json = JsonBuilder()
+    ask_info_json.add_string("info", "Send POST to /ask with a JSON body containing a prompt field")
+
+    var ask_resp_json = JsonBuilder()
+    ask_resp_json.add_string("response", "AI response placeholder - connect LLM client for live results")
+
+    app.get("/", info_json.build())
+    app.get("/ask", ask_info_json.build())
+    app.post("/ask", ask_resp_json.build())
 
     print("  Endpoints:")
     print("    GET  /     → App info")

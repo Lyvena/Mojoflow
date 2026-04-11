@@ -2,12 +2,16 @@
 MojoFlow Server — HTTP Request handling.
 """
 
-from ..core.types import Header, HttpMethod
+from ..core.types import Header, KeyValue, HttpMethod
 
 
 @value
 struct Request:
-    """Represents an incoming HTTP request."""
+    """Represents an incoming HTTP request.
+
+    Includes route parameters extracted from parameterized paths
+    (e.g., /users/:id → params contains KeyValue("id", "42")).
+    """
 
     var method: String
     var path: String
@@ -15,6 +19,7 @@ struct Request:
     var query_string: String
     var http_version: String
     var headers: List[Header]
+    var params: List[KeyValue]
 
     fn __init__(out self):
         self.method = HttpMethod.GET
@@ -23,6 +28,7 @@ struct Request:
         self.query_string = ""
         self.http_version = "HTTP/1.1"
         self.headers = List[Header]()
+        self.params = List[KeyValue]()
 
     fn __init__(
         out self,
@@ -38,10 +44,15 @@ struct Request:
         self.query_string = query_string
         self.http_version = http_version
         self.headers = List[Header]()
+        self.params = List[KeyValue]()
 
     fn add_header(inout self, name: String, value: String):
         """Add a header to the request."""
         self.headers.append(Header(name, value))
+
+    fn add_param(inout self, key: String, value: String):
+        """Add a route parameter."""
+        self.params.append(KeyValue(key, value))
 
     fn get_header(self, name: String) -> String:
         """Get a header value by name (case-insensitive). Returns empty string if not found."""
@@ -58,6 +69,39 @@ struct Request:
             if self.headers[i].name.lower() == lower_name:
                 return True
         return False
+
+    fn get_param(self, name: String) -> String:
+        """Get a route parameter value by name. Returns empty string if not found."""
+        for i in range(len(self.params)):
+            if self.params[i].key == name:
+                return self.params[i].value
+        return ""
+
+    fn has_param(self, name: String) -> Bool:
+        """Check if a route parameter exists."""
+        for i in range(len(self.params)):
+            if self.params[i].key == name:
+                return True
+        return False
+
+    fn get_query_param(self, name: String) -> String:
+        """Get a query string parameter value. Returns empty string if not found.
+
+        Parses key=value pairs from the query string (separated by &).
+        """
+        if self.query_string == "":
+            return ""
+        var pairs = self.query_string.split("&")
+        for i in range(len(pairs)):
+            var pair = pairs[i]
+            var eq = pair.find("=")
+            if eq != -1:
+                var key = pair[:eq]
+                if key == name:
+                    return pair[eq + 1 :]
+            elif pair == name:
+                return ""
+        return ""
 
     fn is_json(self) -> Bool:
         """Check if the request content type is JSON."""
@@ -80,6 +124,9 @@ struct Request:
 
         Parses the request line, headers, and body from a raw HTTP/1.1 request.
         """
+        if len(raw) == 0:
+            raise Error("Empty HTTP request")
+
         var req = Request()
 
         var header_end = raw.find("\r\n\r\n")

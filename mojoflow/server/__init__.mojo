@@ -7,7 +7,7 @@ serving applications.
 
 from .request import Request
 from .response import Response
-from .router import Route, Router
+from .router import Route, RouteMatch, Router
 from .middleware import Middleware, MiddlewareChain
 from .logger import Logger, LogLevel
 from .http import App

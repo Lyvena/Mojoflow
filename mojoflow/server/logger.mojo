@@ -1,8 +1,8 @@
 """
-MojoFlow Server — Structured logging.
+MojoFlow Server — Structured logging with timestamps.
 """
 
-from time import now
+from python import Python
 
 
 @value
@@ -47,24 +47,45 @@ struct LogLevel:
         return "UNKNOWN"
 
 
+fn _get_timestamp() -> String:
+    """Get current timestamp in ISO-like format via Python."""
+    try:
+        var dt = Python.import_module("datetime")
+        var now = dt.datetime.now()
+        return String(str(now.strftime("%Y-%m-%d %H:%M:%S")))
+    except:
+        return "----"
+
+
 struct Logger:
     """Structured logger for MojoFlow applications.
 
-    Supports log levels and prefixed output.
+    Supports log levels, timestamps, and prefixed output.
     """
 
     var prefix: String
     var min_level: LogLevel
+    var show_timestamp: Bool
 
-    fn __init__(out self, prefix: String = "MojoFlow", level: String = "info"):
+    fn __init__(
+        out self,
+        prefix: String = "MojoFlow",
+        level: String = "info",
+        show_timestamp: Bool = True,
+    ):
         self.prefix = prefix
         self.min_level = LogLevel.from_string(level)
+        self.show_timestamp = show_timestamp
 
     fn _should_log(self, level: LogLevel) -> Bool:
         return level.level >= self.min_level.level
 
     fn _format(self, level: LogLevel, message: String) -> String:
-        return "[" + self.prefix + "] [" + level.name() + "] " + message
+        var result = String("[" + self.prefix + "]")
+        if self.show_timestamp:
+            result += " [" + _get_timestamp() + "]"
+        result += " [" + level.name() + "] " + message
+        return result
 
     fn debug(self, message: String):
         var level = LogLevel(LogLevel.DEBUG)
@@ -91,7 +112,9 @@ struct Logger:
         if self._should_log(level):
             print(self._format(level, message))
 
-    fn request(self, method: String, path: String, status: Int):
-        """Log an HTTP request with method, path, and response status."""
+    fn request(self, method: String, path: String, status: Int, duration_ms: Float64 = 0):
+        """Log an HTTP request with method, path, status, and optional duration."""
         var msg = method + " " + path + " -> " + String(status)
+        if duration_ms > 0:
+            msg += " (" + String(Int(duration_ms)) + "ms)"
         self.info(msg)

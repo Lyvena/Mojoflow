@@ -1,14 +1,11 @@
 """
-MojoFlow AI — AI-native primitives for LLM integration, agents, and orchestration.
+MojoFlow AI — Artificial intelligence primitives.
 
-This module provides first-class AI capabilities including:
-- LLM call abstraction with provider support
-- Prompt-to-function mapping
-- Agent execution loops
-- Task orchestration pipelines
+Built-in support for LLM calls, prompt management, autonomous agents,
+and task orchestration. This is the key differentiator of MojoFlow.
 """
 
-from .llm import LLMClient, LLMResponse
+from .llm import LLMClient, LLMResponse, RetryPolicy
 from .prompt import PromptTemplate, PromptRegistry
 from .agent import Agent, AgentConfig
 from .orchestrator import Task, Pipeline, Orchestrator
