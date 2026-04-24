@@ -6,10 +6,12 @@ massive concurrency via Fibers, epoll-driven I/O, and MAX
 parallelism.
 
 Modules:
-    errors  — Structured, categorised error types.
-    config  — Server configuration with production-safe defaults.
-    types   — Core HTTP primitives (Request, Response, Headers, …).
-    server  — Server, Router, and connection handling.
+    errors   — Structured, categorised error types.
+    config   — Server configuration with compile-time defaults.
+    types    — Core HTTP primitives (Request, Response, Headers, …).
+    net      — Low-level async networking (sockets, event loop, I/O).
+    runtime  — Fiber pool, task queue, and async runtime scheduler.
+    server   — Server, Router, and request handling.
 
 Quick start:
     from mojoflow.server import Server, ServerConfig, Request, Response
@@ -38,6 +40,28 @@ from .types import (
     RouteParam,
     Request,
     Response,
+)
+
+# ── Networking ────────────────────────────────────────────────────
+from .net import (
+    AsyncSocket,
+    AsyncListener,
+    AsyncConnection,
+    EventLoop,
+    IOEvent,
+)
+
+# ── Runtime ───────────────────────────────────────────────────────
+from .runtime import (
+    FiberState,
+    FiberHandle,
+    FiberPool,
+    TaskQueue,
+    AsyncRuntime,
+    run_forever,
+    spawn_fiber,
+    await_all,
+    parallelize_work,
 )
 
 # ── Server & Routing ─────────────────────────────────────────────
