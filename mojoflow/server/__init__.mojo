@@ -1,13 +1,50 @@
 """
-MojoFlow Server — HTTP server, routing, middleware, and logging.
+MojoFlow Server — High-performance async HTTP server for Mojo.
 
-Provides the backend web framework layer for building APIs and
-serving applications.
+A pure-Mojo, zero-Python-interop HTTP/1.1 server designed for
+massive concurrency via Fibers, epoll-driven I/O, and MAX
+parallelism.
+
+Modules:
+    errors  — Structured, categorised error types.
+    config  — Server configuration with production-safe defaults.
+    types   — Core HTTP primitives (Request, Response, Headers, …).
+    server  — Server, Router, and connection handling.
+
+Quick start:
+    from mojoflow.server import Server, ServerConfig, Request, Response
+
+    fn main() raises:
+        var cfg = ServerConfig(port=3000)
+        var srv = Server(cfg)
+        srv.get("/", '{"status": "ok"}')
+        srv.listen_and_serve()
 """
 
-from .request import Request
-from .response import Response
-from .router import Route, RouteMatch, Router
-from .middleware import Middleware, MiddlewareChain
-from .logger import Logger, LogLevel
-from .http import App
+# ── Errors ────────────────────────────────────────────────────────
+from .errors import ErrorKind, ServerError
+
+# ── Configuration ─────────────────────────────────────────────────
+from .config import ServerConfig, TLSConfig
+
+# ── HTTP Types ────────────────────────────────────────────────────
+from .types import (
+    HTTPVersion,
+    HTTPMethod,
+    StatusCode,
+    HeaderEntry,
+    Headers,
+    QueryParam,
+    RouteParam,
+    Request,
+    Response,
+)
+
+# ── Server & Routing ─────────────────────────────────────────────
+from .server import (
+    Route,
+    RouteMatch,
+    Router,
+    ConnectionState,
+    Server,
+)
