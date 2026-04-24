@@ -65,6 +65,19 @@ from .runtime import (
     parallelize_work,
 )
 
+# ── HTTP Parser / Serializer ──────────────────────────────────────
+from .http_parser import (
+    ByteView,
+    ParseStatus,
+    ParseResult,
+    parse_request,
+    parse_request_view,
+    serialize_response,
+    serialize_chunked,
+    decode_chunked,
+    test_parse as test_http_parser,
+)
+
 # ── Server & Routing ─────────────────────────────────────────────
 from .server import (
     Route,
