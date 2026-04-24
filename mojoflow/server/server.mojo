@@ -580,8 +580,9 @@ struct Server:
         TODO:
             - epoll_create / epoll_ctl / epoll_wait integration.
             - Fiber pool: spawn a Fiber per accepted fd.
-            - `parallelize(num_workers)` across CPU cores.
-            - Graceful shutdown: stop accepting, drain in-flight, close.
+            - `parallelize(worker_fibers)` across CPU cores.
+            - Graceful shutdown: stop accepting, drain in-flight,
+              wait shutdown_timeout_ms, then force-close.
             - Signal handler for SIGTERM / SIGINT.
         """
         self.config.validate()
@@ -589,11 +590,17 @@ struct Server:
         print("[MojoFlow] " + self.config.server_name)
         print("[MojoFlow] Binding to " + self.config.address())
         print(
-            "[MojoFlow] Workers: "
-            + String(self.config.num_workers)
-            + "  Max connections: "
+            "[MojoFlow] Fibers: "
+            + String(self.config.worker_fibers)
+            + "  Stack: "
+            + String(self.config.fiber_stack_size)
+            + " B  Max connections: "
             + String(self.config.max_connections)
         )
+        if self.config.debug:
+            print("[MojoFlow] DEBUG mode enabled")
+        if self.config.tls_enabled:
+            print("[MojoFlow] TLS termination enabled (not yet implemented)")
 
         # ── Create socket ─────────────────────────────────────────
         var fd = external_call["socket", Int32, Int32, Int32, Int32](
@@ -658,8 +665,8 @@ struct Server:
             raise ServerError.bind("listen() failed").to_error()
 
         print(
-            "[MojoFlow] Listening on http://"
-            + self.config.address()
+            "[MojoFlow] Listening on "
+            + self.config.base_url()
             + "  ("
             + String(self.router.route_count())
             + " routes)"
