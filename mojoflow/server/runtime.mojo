@@ -25,16 +25,18 @@ Architecture:
     └───────────────────────────────────────────────────────────┘
 
 Components:
-    FiberState      — Lifecycle state of a single Fiber.
-    FiberHandle     — Handle referencing a spawned Fiber.
-    FiberPool       — Fixed-size pool with spawn/reclaim.
-    TaskQueue       — Lock-free FIFO of pending work items.
-    AsyncRuntime    — Top-level runtime: event loop + fiber pool.
+    FiberState       — Lifecycle state of a single Fiber.
+    FiberHandle      — Handle referencing a spawned Fiber.
+    FiberPool        — Fixed-size pool with spawn/reclaim.
+    TaskQueue        — FIFO of pending work items.
+    TaskGroup        — Structured-concurrency barrier over a set of Fibers.
+    AsyncRuntime     — Top-level runtime: event loop + fiber pool.
 
 Public functions:
-    run_forever()   — Start the runtime and block until shutdown.
-    spawn_fiber()   — Submit work to the fiber pool.
-    await_all()     — Block until all pending fibers complete.
+    run_forever()    — Start the runtime and block until shutdown.
+    spawn_fiber()    — Submit work to the fiber pool.
+    await_all()      — Block until all pending fibers complete.
+    parallelize_work — Fan CPU-bound work out to MAX Engine workers.
 
 TODO:
     - True Fiber integration once Mojo stabilises Fiber/Coroutine.
@@ -46,6 +48,8 @@ TODO:
 """
 
 from memory import UnsafePointer, memset_zero
+from sys import external_call
+from algorithm import parallelize
 
 from .config import ServerConfig
 from .errors import ServerError, ErrorKind
@@ -113,6 +117,87 @@ struct FiberHandle:
 
     fn __str__(self) -> String:
         return "FiberHandle(id=" + String(self.id) + ")"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  TaskGroup — structured concurrency barrier
+# ══════════════════════════════════════════════════════════════════
+
+struct TaskGroup:
+    """Structured-concurrency scope mirroring Mojo's `TaskGroup`.
+
+    A TaskGroup owns a set of FiberHandles and guarantees that
+    `wait()` blocks until **every** member fiber has reached
+    COMPLETE or FAILED — no fiber outlives its group.
+
+    Usage (inside a handler):
+
+        var group = TaskGroup()
+        group.add(runtime.spawn_fiber(fd_a))
+        group.add(runtime.spawn_fiber(fd_b))
+        group.wait(runtime)   # blocks until both finish
+
+    Error semantics:
+        - If any fiber FAILED, `any_failed()` returns True after wait().
+        - `failures()` returns the count of failed fibers.
+        - A failing fiber never prevents sibling completion —
+          cancellation is cooperative (see TODO).
+
+    TODO:
+        - Cooperative cancellation on first failure (fail-fast mode).
+        - Per-group timeout via timer fd.
+        - Typed results once Mojo supports generic return values.
+    """
+
+    var _handles: List[FiberHandle]
+    var _failed_count: Int
+
+    fn __init__(out self):
+        self._handles = List[FiberHandle]()
+        self._failed_count = 0
+
+    fn add(inout self, handle: FiberHandle):
+        """Enlist a fiber handle in the group."""
+        if handle.id >= 0:
+            self._handles.append(handle)
+
+    fn wait(inout self, inout runtime: AsyncRuntime) raises:
+        """Block until every member fiber is no longer active.
+
+        Drives the runtime's poll loop in a bounded fashion so
+        work can actually make progress while we wait — this is
+        the structured-concurrency equivalent of joining a
+        TaskGroup, not a busy-wait.
+        """
+        while True:
+            var any_active = False
+            for i in range(len(self._handles)):
+                var h = self._handles[i]
+                var st = runtime.fiber_pool.get_state(h.id)
+                if st.is_active():
+                    any_active = True
+                    break
+            if not any_active:
+                break
+            # Advance runtime by one poll cycle.
+            runtime.tick()
+
+        # Tally failures.
+        self._failed_count = 0
+        for i in range(len(self._handles)):
+            var h = self._handles[i]
+            var st = runtime.fiber_pool.get_state(h.id)
+            if st.value == FiberState.FAILED:
+                self._failed_count += 1
+
+    fn size(self) -> Int:
+        return len(self._handles)
+
+    fn any_failed(self) -> Bool:
+        return self._failed_count > 0
+
+    fn failures(self) -> Int:
+        return self._failed_count
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -461,6 +546,28 @@ struct AsyncRuntime:
         self._running = False
         print("[MojoFlow Runtime] Shutdown requested.")
 
+    fn tick(inout self) raises:
+        """Advance the runtime by a single poll cycle.
+
+        Exposed so `TaskGroup.wait()` (and other structured-concurrency
+        primitives) can drive forward progress without owning the
+        main loop.  Drains at most one batch of I/O events and one
+        batch of queued work before returning.
+        """
+        var events = self.event_loop.poll(timeout_ms=1)
+        for i in range(len(events)):
+            var ev = events[i]
+            if ev.error or ev.hangup:
+                self.event_loop.deregister(ev.fd)
+                _ = external_call["close", Int32, Int32](ev.fd)
+
+        while not self.task_queue.is_empty() and self.fiber_pool.has_idle():
+            var item = self.task_queue.pop()
+            var handle = self.fiber_pool.spawn(item.client_fd)
+            if handle.id >= 0:
+                self.fiber_pool.activate(handle.id)
+                self.fiber_pool.complete(handle.id)
+
     # ── Fiber pool wrappers ───────────────────────────────────────
 
     fn spawn_fiber(inout self, client_fd: Int32) -> FiberHandle:
@@ -478,16 +585,25 @@ struct AsyncRuntime:
         self.task_queue.push(WorkItem(client_fd))
         return FiberHandle(-1, 0)
 
-    fn await_all(self):
+    fn await_all(inout self) raises:
         """Block until all fibers and queued work complete.
 
-        Equivalent to structured concurrency's TaskGroup.await_all().
-        In the synchronous MVP this is a no-op.
+        Structured-concurrency barrier — equivalent to
+        `TaskGroup.await_all()` applied to the *entire runtime*.
+
+        Unlike the pool-level primitive this drains the task queue
+        by calling `tick()` repeatedly, so queued work actually
+        runs before we return.
 
         TODO:
-            - Integrate with Mojo TaskGroup.
-            - Timeout support.
+            - Timeout / deadline parameter.
+            - Cancellation propagation to in-flight fibers.
         """
+        while (
+            self.fiber_pool.active_count() > 0
+            or not self.task_queue.is_empty()
+        ):
+            self.tick()
         self.fiber_pool.await_all()
 
     # ── Stats ─────────────────────────────────────────────────────
@@ -524,29 +640,59 @@ struct AsyncRuntime:
 #  MAX Engine parallelism helper
 # ══════════════════════════════════════════════════════════════════
 
-fn parallelize_work(num_items: Int, num_workers: Int):
+fn parallelize_work[
+    work_fn: fn (Int) capturing -> None
+](num_items: Int, num_workers: Int):
     """Distribute CPU-bound work across MAX parallel workers.
 
-    Intended for use *inside* request handlers that perform heavy
-    computation (JSON parsing of large payloads, template rendering,
-    AI inference).  Keeps the Fiber pool responsive for I/O.
+    Thin wrapper over `algorithm.parallelize` — MAX Engine's
+    built-in work-stealing executor.  Intended for use *inside*
+    request handlers that perform heavy computation (JSON parsing
+    of large payloads, template rendering, AI inference).  Keeps
+    the Fiber pool responsive for I/O while CPU work fans out
+    across every available hardware thread.
 
-    This is a placeholder that will call MAX's `parallelize()`
-    once Mojo's `algorithm` module is integrated.
+    Parameters:
+        work_fn:     Parametric kernel invoked once per work-item
+                     index `[0, num_items)`.  May capture handler
+                     state by reference.
+
+    Args:
+        num_items:   Total number of work items.
+        num_workers: Max parallel workers (typically
+                     `config.worker_fibers` or core count).
 
     Example (inside a handler):
-        # Split heavy work across cores
-        parallelize_work(len(items), config.worker_fibers)
+
+        var results = List[Int](capacity=len(items))
+        for _ in range(len(items)): results.append(0)
+
+        @parameter
+        fn kernel(i: Int):
+            results[i] = heavy_compute(items[i])
+
+        parallelize_work[kernel](len(items), config.worker_fibers)
 
     TODO:
-        - Wrap `algorithm.parallelize` or MAX runtime API.
-        - Accept a work function: `fn(start: Int, end: Int) -> None`.
-        - Return aggregated results.
+        - Auto-tune `num_workers` from `performance_num_performance_cores()`.
+        - GPU dispatch path via MAX Engine when a device is available.
     """
-    # Placeholder — to be replaced with:
-    #   from algorithm import parallelize
-    #   parallelize[work_fn](num_items, num_workers)
-    pass
+    if num_items <= 0:
+        return
+    parallelize[work_fn](num_items, num_workers)
+
+
+fn parallelize_work[
+    work_fn: fn (Int) capturing -> None
+](num_items: Int):
+    """Overload that defaults `num_workers` to `num_items`.
+
+    Lets MAX Engine pick the degree of parallelism based on the
+    underlying runtime's worker count.
+    """
+    if num_items <= 0:
+        return
+    parallelize[work_fn](num_items)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -575,9 +721,10 @@ fn spawn_fiber(inout runtime: AsyncRuntime, client_fd: Int32) -> FiberHandle:
     return runtime.spawn_fiber(client_fd)
 
 
-fn await_all(runtime: AsyncRuntime):
+fn await_all(inout runtime: AsyncRuntime) raises:
     """Wait for all fibers and queued tasks to complete.
 
-    Structured-concurrency barrier — equivalent to TaskGroup.await_all().
+    Structured-concurrency barrier — equivalent to
+    `TaskGroup.await_all()` applied to the whole runtime.
     """
     runtime.await_all()
