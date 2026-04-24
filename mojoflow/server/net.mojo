@@ -77,15 +77,32 @@ alias EPOLL_CTL_ADD: Int32 = 1
 alias EPOLL_CTL_DEL: Int32 = 2
 alias EPOLL_CTL_MOD: Int32 = 3
 
-# --- kqueue (macOS) ---
+# --- kqueue (macOS/BSD) ---
 alias EVFILT_READ: Int16 = -1
 alias EVFILT_WRITE: Int16 = -2
 alias EV_ADD: UInt16 = 0x0001
 alias EV_DELETE: UInt16 = 0x0002
 alias EV_ENABLE: UInt16 = 0x0004
 alias EV_ONESHOT: UInt16 = 0x0010
-alias EV_CLEAR: UInt16 = 0x0020
+alias EV_CLEAR: UInt16 = 0x0020  # edge-triggered (kqueue's analogue of EPOLLET)
+alias EV_ERROR: UInt16 = 0x4000
 alias EV_EOF: UInt16 = 0x8000
+
+# --- WSAPoll (Windows) ---
+# NOTE: true IOCP is a proactor model that would require reworking
+# AsyncConnection to issue overlapped WSARecv / WSASend *before* the
+# event loop returns a completion.  WSAPoll matches the existing
+# reactor-style readiness API used on Linux/macOS and lets the same
+# AsyncConnection code path work unchanged.  A real IOCP backend is
+# tracked in the TODO block below.
+alias POLLRDNORM: Int16 = 0x0100
+alias POLLRDBAND: Int16 = 0x0200
+alias POLLIN_WIN: Int16 = 0x0300   # POLLRDNORM | POLLRDBAND
+alias POLLWRNORM: Int16 = 0x0010
+alias POLLOUT_WIN: Int16 = 0x0010
+alias POLLERR_WIN: Int16 = 0x0001
+alias POLLHUP_WIN: Int16 = 0x0002
+alias POLLNVAL_WIN: Int16 = 0x0004
 
 # --- Compile-time max events per poll ---
 alias MAX_EVENTS: Int = 1024
@@ -128,6 +145,92 @@ struct EpollEvent:
 
     fn fd(self) -> Int32:
         return Int32(self.data)
+
+
+@value
+@register_passable("trivial")
+struct KEvent:
+    """BSD / macOS `struct kevent` (32 bytes on 64-bit targets).
+
+    Layout:
+        uintptr_t ident;   // fd
+        int16_t   filter;  // EVFILT_READ / EVFILT_WRITE
+        uint16_t  flags;   // EV_ADD | EV_CLEAR | ...
+        uint32_t  fflags;
+        intptr_t  data;
+        void*     udata;
+    """
+    var ident: UInt64
+    var filter: Int16
+    var flags: UInt16
+    var fflags: UInt32
+    var data: Int64
+    var udata: UInt64
+
+    fn __init__(out self):
+        self.ident = 0
+        self.filter = 0
+        self.flags = 0
+        self.fflags = 0
+        self.data = 0
+        self.udata = 0
+
+    fn __init__(
+        out self,
+        fd: Int32,
+        filter: Int16,
+        flags: UInt16,
+    ):
+        self.ident = UInt64(fd)
+        self.filter = filter
+        self.flags = flags
+        self.fflags = 0
+        self.data = 0
+        self.udata = 0
+
+    fn fd(self) -> Int32:
+        return Int32(self.ident)
+
+
+@value
+@register_passable("trivial")
+struct Timespec:
+    """POSIX `struct timespec` (16 bytes on 64-bit)."""
+    var tv_sec: Int64
+    var tv_nsec: Int64
+
+    fn __init__(out self, ms: Int):
+        self.tv_sec = Int64(ms) // 1000
+        self.tv_nsec = (Int64(ms) % 1000) * 1_000_000
+
+
+@value
+@register_passable("trivial")
+struct WSAPollFd:
+    """Windows `WSAPOLLFD` struct (16 bytes on 64-bit Windows).
+
+    Layout:
+        SOCKET fd;       // 8 bytes (uintptr_t)
+        SHORT  events;   // 2 bytes
+        SHORT  revents;  // 2 bytes
+        // 4 bytes tail padding
+    """
+    var fd: UInt64
+    var events: Int16
+    var revents: Int16
+    var _pad: UInt32
+
+    fn __init__(out self):
+        self.fd = 0
+        self.events = 0
+        self.revents = 0
+        self._pad = 0
+
+    fn __init__(out self, fd: Int32, events: Int16):
+        self.fd = UInt64(fd)
+        self.events = events
+        self.revents = 0
+        self._pad = 0
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -308,12 +411,17 @@ struct IOEvent:
 struct EventLoop:
     """Edge-triggered I/O event multiplexer.
 
-    Uses epoll on Linux, kqueue on macOS.  All registered fds must
-    be non-blocking.
+    Per-platform backend selected at compile time via `@parameter if`:
 
-    Edge-triggered mode means the kernel notifies only on *state
-    transitions* — the consumer must drain all available data on
-    each notification or risk missing events.
+        Linux   → epoll (EPOLLET edge-triggered)
+        macOS   → kqueue (EV_CLEAR edge-triggered)
+        Windows → WSAPoll (readiness model)
+
+    All registered fds must be non-blocking.  Edge-triggered mode
+    means the kernel notifies only on *state transitions* — the
+    consumer must drain all available data on each notification or
+    risk missing events.  WSAPoll is level-triggered; the runtime
+    compensates by not returning until recv/send have fully drained.
 
     Example:
         var loop = EventLoop.create()
@@ -324,21 +432,37 @@ struct EventLoop:
                 handle(events[i])
 
     TODO:
-        - kqueue implementation (macOS).
+        - True IOCP proactor on Windows (requires AsyncConnection to
+          issue overlapped WSARecv / WSASend ahead of the poll loop).
         - io_uring backend (Linux 5.6+).
-        - IOCP backend (Windows).
-        - Timer fd integration for timeouts.
+        - Timer fd / kevent EVFILT_TIMER integration for timeouts.
         - Signal fd for graceful shutdown.
     """
 
+    # Backend-neutral handle:
+    #   Linux   → epoll fd
+    #   macOS   → kqueue fd
+    #   Windows → unused (-1)
     var _epoll_fd: Int32
-    var _event_buf: UnsafePointer[EpollEvent]
+
+    # Raw byte buffer re-cast per-platform:
+    #   Linux   → MAX_EVENTS × EpollEvent (12 B each)
+    #   macOS   → MAX_EVENTS × KEvent     (32 B each)
+    #   Windows → MAX_EVENTS × WSAPollFd  (16 B each)
+    var _event_buf: UnsafePointer[UInt8]
     var _max_events: Int
+
+    # Windows-only: WSAPoll requires the caller to maintain the fd
+    # set.  These fields are harmless on Linux/macOS (never touched).
+    var _wsa_fds: List[Int32]
+    var _wsa_events: List[Int16]
 
     fn __init__(out self):
         self._epoll_fd = -1
         self._max_events = MAX_EVENTS
-        self._event_buf = UnsafePointer[EpollEvent]()
+        self._event_buf = UnsafePointer[UInt8]()
+        self._wsa_fds = List[Int32]()
+        self._wsa_events = List[Int16]()
 
     fn __del__(owned self):
         if self._epoll_fd >= 0:
@@ -348,11 +472,7 @@ struct EventLoop:
 
     @staticmethod
     fn create() raises -> EventLoop:
-        """Create the platform event loop.
-
-        Linux: epoll_create1(0).
-        macOS: kqueue().  (TODO)
-        """
+        """Create the platform event loop."""
         var loop = EventLoop()
 
         @parameter
@@ -360,85 +480,180 @@ struct EventLoop:
             loop._epoll_fd = external_call["epoll_create1", Int32, Int32](0)
             if loop._epoll_fd < 0:
                 raise ServerError.epoll("epoll_create1() failed").to_error()
+            loop._event_buf = UnsafePointer[UInt8].alloc(MAX_EVENTS * 12)
+            memset_zero(loop._event_buf, MAX_EVENTS * 12)
         elif os_is_macos():
-            # TODO: kqueue() implementation
             loop._epoll_fd = external_call["kqueue", Int32]()
             if loop._epoll_fd < 0:
                 raise ServerError.epoll("kqueue() failed").to_error()
+            loop._event_buf = UnsafePointer[UInt8].alloc(MAX_EVENTS * 32)
+            memset_zero(loop._event_buf, MAX_EVENTS * 32)
+        elif os_is_windows():
+            # WSAPoll requires no kernel handle — the caller owns the
+            # fdset.  Still pre-allocate the event buffer so poll()
+            # has a stable backing store.
+            loop._epoll_fd = -1
+            loop._event_buf = UnsafePointer[UInt8].alloc(MAX_EVENTS * 16)
+            memset_zero(loop._event_buf, MAX_EVENTS * 16)
         else:
             raise ServerError.configuration(
                 "Unsupported platform for event loop"
             ).to_error()
 
-        loop._event_buf = UnsafePointer[EpollEvent].alloc(MAX_EVENTS)
-        memset_zero(loop._event_buf, MAX_EVENTS * 12)
         return loop
 
-    fn register(self, fd: Int32, readable: Bool = True,
+    # ── Registration ──────────────────────────────────────────────
+
+    fn register(inout self, fd: Int32, readable: Bool = True,
                 writable: Bool = False) raises:
         """Register an fd for edge-triggered monitoring."""
         @parameter
         if os_is_linux():
-            var events: UInt32 = EPOLLET  # always edge-triggered
-            if readable:
-                events = events | EPOLLIN
-            if writable:
-                events = events | EPOLLOUT
-            events = events | EPOLLRDHUP
-
-            var ev = EpollEvent(events, fd)
-            var ev_ptr = UnsafePointer[EpollEvent].alloc(1)
-            ev_ptr[] = ev
-            var rc = external_call[
-                "epoll_ctl", Int32,
-                Int32, Int32, Int32, UnsafePointer[EpollEvent],
-            ](self._epoll_fd, EPOLL_CTL_ADD, fd, ev_ptr)
-            ev_ptr.free()
-            if rc < 0:
-                raise ServerError.epoll(
-                    "epoll_ctl ADD failed", "fd=" + String(Int(fd))
-                ).to_error()
+            self._linux_ctl(fd, readable, writable, EPOLL_CTL_ADD)
         elif os_is_macos():
-            # TODO: kevent() EV_ADD with EVFILT_READ / EVFILT_WRITE
-            pass
+            self._kqueue_ctl(fd, readable, writable, EV_ADD | EV_CLEAR)
+        elif os_is_windows():
+            self._wsa_add(fd, readable, writable)
 
-    fn modify(self, fd: Int32, readable: Bool = True,
+    fn modify(inout self, fd: Int32, readable: Bool = True,
               writable: Bool = False) raises:
         """Modify interest set for an already-registered fd."""
         @parameter
         if os_is_linux():
-            var events: UInt32 = EPOLLET | EPOLLRDHUP
-            if readable:
-                events = events | EPOLLIN
-            if writable:
-                events = events | EPOLLOUT
+            self._linux_ctl(fd, readable, writable, EPOLL_CTL_MOD)
+        elif os_is_macos():
+            # kqueue has no "modify"; re-adding with EV_ADD replaces
+            # the existing kevent for (ident, filter).  First clear
+            # the opposite filter if it was previously active.
+            self._kqueue_ctl(fd, readable, writable, EV_ADD | EV_CLEAR)
+        elif os_is_windows():
+            self._wsa_remove(fd)
+            self._wsa_add(fd, readable, writable)
 
-            var ev = EpollEvent(events, fd)
-            var ev_ptr = UnsafePointer[EpollEvent].alloc(1)
-            ev_ptr[] = ev
-            var rc = external_call[
-                "epoll_ctl", Int32,
-                Int32, Int32, Int32, UnsafePointer[EpollEvent],
-            ](self._epoll_fd, EPOLL_CTL_MOD, fd, ev_ptr)
-            ev_ptr.free()
-            if rc < 0:
-                raise ServerError.epoll(
-                    "epoll_ctl MOD failed", "fd=" + String(Int(fd))
-                ).to_error()
-
-    fn deregister(self, fd: Int32):
-        """Remove an fd from the event loop."""
+    fn deregister(inout self, fd: Int32):
+        """Remove an fd from the event loop (best effort — never raises)."""
         @parameter
         if os_is_linux():
             _ = external_call[
                 "epoll_ctl", Int32,
                 Int32, Int32, Int32, UnsafePointer[EpollEvent],
             ](self._epoll_fd, EPOLL_CTL_DEL, fd, UnsafePointer[EpollEvent]())
+        elif os_is_macos():
+            # Delete both read + write filters; ignore errors (fd may
+            # have only one registered).
+            var ch = UnsafePointer[KEvent].alloc(2)
+            ch[0] = KEvent(fd, EVFILT_READ, EV_DELETE)
+            ch[1] = KEvent(fd, EVFILT_WRITE, EV_DELETE)
+            _ = external_call[
+                "kevent", Int32,
+                Int32, UnsafePointer[KEvent], Int32,
+                UnsafePointer[KEvent], Int32, UnsafePointer[Timespec],
+            ](
+                self._epoll_fd, ch, 2,
+                UnsafePointer[KEvent](), 0, UnsafePointer[Timespec](),
+            )
+            ch.free()
+        elif os_is_windows():
+            self._wsa_remove(fd)
+
+    # ── Linux / epoll helper ──────────────────────────────────────
+
+    fn _linux_ctl(
+        self, fd: Int32, readable: Bool, writable: Bool, op: Int32,
+    ) raises:
+        var events: UInt32 = EPOLLET | EPOLLRDHUP
+        if readable:
+            events = events | EPOLLIN
+        if writable:
+            events = events | EPOLLOUT
+        var ev = EpollEvent(events, fd)
+        var ev_ptr = UnsafePointer[EpollEvent].alloc(1)
+        ev_ptr[] = ev
+        var rc = external_call[
+            "epoll_ctl", Int32,
+            Int32, Int32, Int32, UnsafePointer[EpollEvent],
+        ](self._epoll_fd, op, fd, ev_ptr)
+        ev_ptr.free()
+        if rc < 0:
+            raise ServerError.epoll(
+                "epoll_ctl failed", "fd=" + String(Int(fd))
+            ).to_error()
+
+    # ── macOS / kqueue helper ─────────────────────────────────────
+
+    fn _kqueue_ctl(
+        self, fd: Int32, readable: Bool, writable: Bool, flags: UInt16,
+    ) raises:
+        """Submit one or two kevent changes.  `flags` is applied to
+        each (e.g. EV_ADD | EV_CLEAR for edge-triggered register)."""
+        var n: Int = 0
+        var changes = UnsafePointer[KEvent].alloc(2)
+        if readable:
+            changes[n] = KEvent(fd, EVFILT_READ, flags)
+            n += 1
+        if writable:
+            changes[n] = KEvent(fd, EVFILT_WRITE, flags)
+            n += 1
+        if n == 0:
+            changes.free()
+            return
+        var rc = external_call[
+            "kevent", Int32,
+            Int32, UnsafePointer[KEvent], Int32,
+            UnsafePointer[KEvent], Int32, UnsafePointer[Timespec],
+        ](
+            self._epoll_fd, changes, Int32(n),
+            UnsafePointer[KEvent](), 0, UnsafePointer[Timespec](),
+        )
+        changes.free()
+        if rc < 0:
+            raise ServerError.epoll(
+                "kevent() register failed", "fd=" + String(Int(fd))
+            ).to_error()
+
+    # ── Windows / WSAPoll helpers ─────────────────────────────────
+
+    fn _wsa_events_mask(self, readable: Bool, writable: Bool) -> Int16:
+        var m: Int16 = 0
+        if readable:
+            m = m | POLLIN_WIN
+        if writable:
+            m = m | POLLOUT_WIN
+        return m
+
+    fn _wsa_find(self, fd: Int32) -> Int:
+        for i in range(len(self._wsa_fds)):
+            if self._wsa_fds[i] == fd:
+                return i
+        return -1
+
+    fn _wsa_add(inout self, fd: Int32, readable: Bool, writable: Bool):
+        var mask = self._wsa_events_mask(readable, writable)
+        var idx = self._wsa_find(fd)
+        if idx >= 0:
+            self._wsa_events[idx] = mask
+        else:
+            self._wsa_fds.append(fd)
+            self._wsa_events.append(mask)
+
+    fn _wsa_remove(inout self, fd: Int32):
+        var idx = self._wsa_find(fd)
+        if idx < 0:
+            return
+        var new_fds = List[Int32]()
+        var new_events = List[Int16]()
+        for i in range(len(self._wsa_fds)):
+            if i != idx:
+                new_fds.append(self._wsa_fds[i])
+                new_events.append(self._wsa_events[i])
+        self._wsa_fds = new_fds
+        self._wsa_events = new_events
+
+    # ── Poll ──────────────────────────────────────────────────────
 
     fn poll(self, timeout_ms: Int = -1) -> List[IOEvent]:
         """Block until events are ready or timeout expires.
 
-        Returns a list of IOEvent structs for each ready fd.
         timeout_ms = -1 means block indefinitely.
         timeout_ms = 0  means return immediately (non-blocking poll).
         """
@@ -446,22 +661,77 @@ struct EventLoop:
 
         @parameter
         if os_is_linux():
+            var buf = self._event_buf.bitcast[EpollEvent]()
             var n = external_call[
                 "epoll_wait", Int32,
                 Int32, UnsafePointer[EpollEvent], Int32, Int32,
-            ](self._epoll_fd, self._event_buf, Int32(self._max_events),
+            ](self._epoll_fd, buf, Int32(self._max_events),
               Int32(timeout_ms))
-
             if n <= 0:
                 return results
-
             for i in range(Int(n)):
-                var ev = self._event_buf[i]
+                var ev = buf[i]
                 var readable = (ev.events & EPOLLIN) != 0
                 var writable = (ev.events & EPOLLOUT) != 0
                 var err = (ev.events & EPOLLERR) != 0
                 var hup = (ev.events & (EPOLLHUP | EPOLLRDHUP)) != 0
                 results.append(IOEvent(ev.fd(), readable, writable, err, hup))
+
+        elif os_is_macos():
+            var buf = self._event_buf.bitcast[KEvent]()
+            var ts = Timespec(timeout_ms if timeout_ms >= 0 else 0)
+            var ts_ptr = UnsafePointer[Timespec].alloc(1)
+            ts_ptr[] = ts
+            var ts_arg = ts_ptr if timeout_ms >= 0 else UnsafePointer[Timespec]()
+            var n = external_call[
+                "kevent", Int32,
+                Int32, UnsafePointer[KEvent], Int32,
+                UnsafePointer[KEvent], Int32, UnsafePointer[Timespec],
+            ](
+                self._epoll_fd,
+                UnsafePointer[KEvent](), 0,
+                buf, Int32(self._max_events),
+                ts_arg,
+            )
+            ts_ptr.free()
+            if n <= 0:
+                return results
+            for i in range(Int(n)):
+                var ev = buf[i]
+                var readable = ev.filter == EVFILT_READ
+                var writable = ev.filter == EVFILT_WRITE
+                var err = (ev.flags & EV_ERROR) != 0
+                var hup = (ev.flags & EV_EOF) != 0
+                results.append(IOEvent(ev.fd(), readable, writable, err, hup))
+
+        elif os_is_windows():
+            # Materialise caller-maintained fdset into the WSAPollFd
+            # event buffer, then call WSAPoll.
+            var count = len(self._wsa_fds)
+            if count == 0:
+                return results
+            if count > self._max_events:
+                count = self._max_events
+            var buf = self._event_buf.bitcast[WSAPollFd]()
+            for i in range(count):
+                buf[i] = WSAPollFd(self._wsa_fds[i], self._wsa_events[i])
+            var n = external_call[
+                "WSAPoll", Int32,
+                UnsafePointer[WSAPollFd], UInt32, Int32,
+            ](buf, UInt32(count), Int32(timeout_ms))
+            if n <= 0:
+                return results
+            for i in range(count):
+                var pfd = buf[i]
+                if pfd.revents == 0:
+                    continue
+                var readable = (pfd.revents & POLLIN_WIN) != 0
+                var writable = (pfd.revents & POLLOUT_WIN) != 0
+                var err = (pfd.revents & (POLLERR_WIN | POLLNVAL_WIN)) != 0
+                var hup = (pfd.revents & POLLHUP_WIN) != 0
+                results.append(
+                    IOEvent(Int32(pfd.fd), readable, writable, err, hup)
+                )
 
         return results
 
