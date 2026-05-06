@@ -40,6 +40,7 @@ struct App:
             port=config.port,
             worker_fibers=config.workers,
             debug=config.debug,
+            log_level=config.log_level,
             server_name=config.app_name,
         )
 

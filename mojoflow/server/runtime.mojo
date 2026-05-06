@@ -637,6 +637,53 @@ struct AsyncRuntime:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  Worker model — OS-thread runtime layout
+# ══════════════════════════════════════════════════════════════════
+
+struct WorkerModel:
+    """Configurable multi-worker runtime topology.
+
+    Each OS worker is intended to own an AsyncRuntime, an EventLoop, and a
+    FiberPool.  MAX parallelism spans the aggregate worker capacity so heavy
+    handler compute can fan out across all configured threads.
+
+    The current server loop still drives one runtime inline while Mojo's stable
+    threading APIs settle; this struct centralises the sizing and MAX fan-out
+    contract so the per-thread runtime split can be enabled without changing
+    handler code.
+    """
+
+    var worker_threads: Int
+    var fibers_per_worker: Int
+    var max_parallel_workers: Int
+
+    fn __init__(out self, config: ServerConfig):
+        self.worker_threads = config.worker_threads
+        self.fibers_per_worker = config.worker_fibers
+        self.max_parallel_workers = config.total_fiber_slots()
+
+    fn total_fibers(self) -> Int:
+        return self.worker_threads * self.fibers_per_worker
+
+    fn run_across_workers[
+        work_fn: fn (Int) capturing -> None
+    ](self):
+        """Run one setup/maintenance task per OS worker via MAX."""
+        parallelize_work[work_fn](self.worker_threads, self.worker_threads)
+
+    fn __str__(self) -> String:
+        return (
+            "WorkerModel(threads="
+            + String(self.worker_threads)
+            + ", fibers_per_worker="
+            + String(self.fibers_per_worker)
+            + ", total_fibers="
+            + String(self.total_fibers())
+            + ")"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════
 #  MAX Engine parallelism helper
 # ══════════════════════════════════════════════════════════════════
 

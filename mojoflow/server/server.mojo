@@ -58,7 +58,8 @@ from .types import (
     RouteParam,
 )
 from .net import AsyncListener
-from .runtime import AsyncRuntime, FiberPool
+from .runtime import AsyncRuntime, FiberPool, WorkerModel
+from .observability import Observability
 from .handler import (
     RequestHandler,
     HandlerContext,
@@ -274,6 +275,60 @@ struct Router:
     fn route_count(self) -> Int:
         return self._count
 
+    fn _openapi_pattern(self, pattern: String) -> String:
+        """Convert MojoFlow `:param` segments to OpenAPI `{param}` segments."""
+        if not (":" in pattern):
+            return pattern
+        var parts = pattern.split("/")
+        var out = ""
+        for i in range(len(parts)):
+            if i > 0:
+                out += "/"
+            var part = parts[i]
+            if len(part) > 0 and part[0] == ":":
+                out += "{" + part[1:] + "}"
+            else:
+                out += part
+        return out
+
+    fn _append_openapi_routes(
+        self,
+        routes: List[Route],
+        method: String,
+        inout out: String,
+        inout first: Bool,
+    ):
+        for i in range(len(routes)):
+            if not first:
+                out += ","
+            first = False
+            var path = self._openapi_pattern(routes[i].pattern)
+            out += '"' + path + '":{'
+            out += '"' + method + '":{'
+            out += '"operationId":"' + method + "_" + String(i) + '",'
+            out += '"responses":{"200":{"description":"OK"}}'
+            out += "}}"
+
+    fn openapi_json(
+        self,
+        title: String = "MojoFlow API",
+        version: String = "0.1.0",
+    ) -> String:
+        """Generate a simple OpenAPI 3.1 document from registered routes."""
+        var out = "{"
+        out += '"openapi":"3.1.0",'
+        out += '"info":{"title":"' + title + '","version":"' + version + '"},'
+        out += '"paths":{'
+        var first = True
+        self._append_openapi_routes(self._get, "get", out, first)
+        self._append_openapi_routes(self._post, "post", out, first)
+        self._append_openapi_routes(self._put, "put", out, first)
+        self._append_openapi_routes(self._delete, "delete", out, first)
+        self._append_openapi_routes(self._patch, "patch", out, first)
+        self._append_openapi_routes(self._other, "x-mojoflow", out, first)
+        out += "}}"
+        return out
+
 
 struct BuiltInRouterHandler(RequestHandler):
     """RequestHandler adapter for the built-in method + path router."""
@@ -482,6 +537,92 @@ struct ConnectionState:
         self.keep_alive = True
 
 
+struct PendingConnectionQueue:
+    """Bounded FIFO for accepted sockets waiting for a Fiber slot."""
+
+    var _fds: List[Int32]
+    var _capacity: Int
+
+    fn __init__(out self):
+        self._fds = List[Int32]()
+        self._capacity = 0
+
+    fn __init__(out self, capacity: Int):
+        self._fds = List[Int32]()
+        self._capacity = capacity
+
+    fn push(inout self, fd: Int32) -> Bool:
+        if self._capacity == 0:
+            return False
+        if len(self._fds) >= self._capacity:
+            return False
+        self._fds.append(fd)
+        return True
+
+    fn pop(inout self) -> Int32:
+        if len(self._fds) == 0:
+            return -1
+        var fd = self._fds[0]
+        var next = List[Int32]()
+        for i in range(1, len(self._fds)):
+            next.append(self._fds[i])
+        self._fds = next
+        return fd
+
+    fn len(self) -> Int:
+        return len(self._fds)
+
+    fn is_empty(self) -> Bool:
+        return len(self._fds) == 0
+
+    fn is_full(self) -> Bool:
+        return self._capacity > 0 and len(self._fds) >= self._capacity
+
+
+struct ConnectionPool:
+    """Reusable connection state slots to avoid hot-path allocation churn."""
+
+    var _fds: List[Int32]
+    var _free: List[Int]
+    var _capacity: Int
+
+    fn __init__(out self):
+        self._fds = List[Int32]()
+        self._free = List[Int]()
+        self._capacity = 0
+
+    fn __init__(out self, capacity: Int):
+        self._fds = List[Int32]()
+        self._free = List[Int]()
+        self._capacity = capacity
+        for i in range(capacity):
+            self._fds.append(-1)
+            self._free.append(i)
+
+    fn acquire(inout self, fd: Int32) -> Int:
+        if len(self._free) == 0:
+            return -1
+        var slot = self._free[len(self._free) - 1]
+        var next = List[Int]()
+        for i in range(len(self._free) - 1):
+            next.append(self._free[i])
+        self._free = next
+        self._fds[slot] = fd
+        return slot
+
+    fn release(inout self, slot: Int):
+        if slot < 0 or slot >= self._capacity:
+            return
+        self._fds[slot] = -1
+        self._free.append(slot)
+
+    fn idle_count(self) -> Int:
+        return len(self._free)
+
+    fn active_count(self) -> Int:
+        return self._capacity - len(self._free)
+
+
 # ══════════════════════════════════════════════════════════════════
 #  Server
 # ══════════════════════════════════════════════════════════════════
@@ -525,34 +666,56 @@ struct Server:
     var _accepting: Bool
     var _shutdown_requested: Bool
     var _connections_total: Int
+    var _observability_routes_registered: Bool
+    var _pending_connections: PendingConnectionQueue
+    var _connection_pool: ConnectionPool
+    var observability: Observability
 
     fn __init__(out self):
         self.config = ServerConfig()
         self.router = Router()
-        self._fiber_pool = FiberPool(self.config.worker_fibers)
+        self._fiber_pool = FiberPool(self.config.total_fiber_slots())
         self._running = False
         self._accepting = False
         self._shutdown_requested = False
         self._connections_total = 0
+        self._observability_routes_registered = False
+        self._pending_connections = PendingConnectionQueue(
+            self.config.max_pending_connections
+        )
+        self._connection_pool = ConnectionPool(self.config.max_connections)
+        self.observability = Observability(self.config)
 
     fn __init__(out self, config: ServerConfig):
         self.config = config
         self.router = Router()
-        self._fiber_pool = FiberPool(config.worker_fibers)
+        self._fiber_pool = FiberPool(config.total_fiber_slots())
         self._running = False
         self._accepting = False
         self._shutdown_requested = False
         self._connections_total = 0
+        self._observability_routes_registered = False
+        self._pending_connections = PendingConnectionQueue(
+            config.max_pending_connections
+        )
+        self._connection_pool = ConnectionPool(config.max_connections)
+        self.observability = Observability(config)
 
     fn __init__(out self, config: ServerConfig, router: Router):
         """Create a server with an externally prepared built-in router."""
         self.config = config
         self.router = router
-        self._fiber_pool = FiberPool(config.worker_fibers)
+        self._fiber_pool = FiberPool(config.total_fiber_slots())
         self._running = False
         self._accepting = False
         self._shutdown_requested = False
         self._connections_total = 0
+        self._observability_routes_registered = False
+        self._pending_connections = PendingConnectionQueue(
+            config.max_pending_connections
+        )
+        self._connection_pool = ConnectionPool(config.max_connections)
+        self.observability = Observability(config)
 
     # ── Route registration (sugar) ────────────────────────────────
 
@@ -722,8 +885,11 @@ struct Server:
                 client_fd,
                 handler,
                 middleware,
+                self.observability,
             )
+            self.observability.mark_connection_closed()
         except:
+            self.observability.mark_connection_closed()
             _ = external_call["close", Int32, Int32](client_fd)
 
     fn _send_busy(self, client_fd: Int32):
@@ -746,16 +912,36 @@ struct Server:
         """Assign a connection to a FiberPool slot and run its handler."""
         var fiber = self._fiber_pool.spawn(client_fd)
         if fiber.id < 0:
-            self._send_busy(client_fd)
+            if not self._pending_connections.push(client_fd):
+                self._send_busy(client_fd)
+                self.observability.mark_connection_closed()
             return
 
+        var pool_slot = self._connection_pool.acquire(client_fd)
         self._fiber_pool.activate(fiber.id)
         try:
             self._handle_connection[H](client_fd, fiber.id, handler)
+            self._connection_pool.release(pool_slot)
             self._fiber_pool.complete(fiber.id)
         except:
+            self._connection_pool.release(pool_slot)
             self._fiber_pool.fail(fiber.id)
             _ = external_call["close", Int32, Int32](client_fd)
+
+    fn _drain_pending[
+        H: RequestHandler,
+    ](
+        inout self,
+        inout handler: H,
+    ):
+        """Move queued sockets into newly available Fiber slots."""
+        while not self._pending_connections.is_empty():
+            if not self._fiber_pool.has_idle():
+                break
+            var fd = self._pending_connections.pop()
+            if fd < 0:
+                break
+            self._dispatch_connection[H](fd, handler)
 
     fn _drain_accepts[
         H: RequestHandler,
@@ -765,12 +951,18 @@ struct Server:
         inout handler: H,
     ):
         """Drain all pending accepts from an edge-triggered listener."""
-        while self._accepting:
+        var accepted = 0
+        while self._accepting and accepted < self.config.accept_batch_size:
+            if self.connection_pressure() >= self.config.max_connections:
+                break
             var client_fd = listener.accept()
             if client_fd < 0:
                 break
+            accepted += 1
             self._connections_total += 1
+            self.observability.mark_connection_open()
             self._dispatch_connection[H](client_fd, handler)
+        self._drain_pending[H](handler)
 
     fn _drain_fibers(inout self):
         """Wait for active Fibers to finish after accepting stops."""
@@ -796,6 +988,37 @@ struct Server:
 
     fn active_fibers(self) -> Int:
         return self._fiber_pool.active_count()
+
+    fn queued_connections(self) -> Int:
+        return self._pending_connections.len()
+
+    fn connection_pressure(self) -> Int:
+        """Active pooled connections plus sockets waiting for a Fiber slot."""
+        return self._connection_pool.active_count() + self._pending_connections.len()
+
+    fn metrics_json(self) -> String:
+        """Return a JSON snapshot of built-in server metrics."""
+        return self.observability.metrics_json()
+
+    fn openapi_json(self) -> String:
+        """Return the generated OpenAPI document for the current router."""
+        return self.router.openapi_json(self.config.server_name, "0.1.0")
+
+    fn _register_observability_routes(inout self):
+        """Install optional built-in observability routes once."""
+        if self._observability_routes_registered:
+            return
+        if self.config.openapi_enabled:
+            self.router.add(
+                Route(
+                    HTTPMethod.GET,
+                    self.config.openapi_path,
+                    self.openapi_json(),
+                    200,
+                    "application/json; charset=utf-8",
+                )
+            )
+        self._observability_routes_registered = True
 
     # ── Main listen loop ──────────────────────────────────────────
 
@@ -833,26 +1056,49 @@ struct Server:
         dispatches every connection to the FiberPool.
         """
         self.config.validate()
+        self.observability = Observability(self.config)
+        self._register_observability_routes()
 
         print("[MojoFlow] " + self.config.server_name)
         print("[MojoFlow] Binding to " + self.config.address())
         print(
             "[MojoFlow] Fibers: "
-            + String(self.config.worker_fibers)
+            + String(self.config.total_fiber_slots())
             + "  Stack: "
             + String(self.config.fiber_stack_size)
             + " B  Max connections: "
             + String(self.config.max_connections)
         )
+        print(
+            "[MojoFlow] Workers: "
+            + String(self.config.worker_threads)
+            + " OS threads  Pending queue: "
+            + String(self.config.max_pending_connections)
+        )
         if self.config.debug:
             print("[MojoFlow] DEBUG mode enabled")
+        if self.config.observability_enabled:
+            print(
+                "[MojoFlow] Observability enabled"
+                + "  logs="
+                + self.config.log_level
+                + "  metrics="
+                + String(self.config.metrics_enabled)
+            )
+            if self.config.openapi_enabled:
+                print("[MojoFlow] OpenAPI: " + self.config.openapi_path)
         if self.config.tls_enabled:
             print("[MojoFlow] TLS termination enabled (not yet implemented)")
 
         var listener = AsyncListener.start(self.config)
+        var worker_model = WorkerModel(self.config)
         var runtime = AsyncRuntime.create(self.config)
         runtime.register_listener(listener.fd())
-        self._fiber_pool = FiberPool(self.config.worker_fibers)
+        self._fiber_pool = FiberPool(self.config.total_fiber_slots())
+        self._pending_connections = PendingConnectionQueue(
+            self.config.max_pending_connections
+        )
+        self._connection_pool = ConnectionPool(self.config.max_connections)
 
         print(
             "[MojoFlow] Listening on "
@@ -861,6 +1107,7 @@ struct Server:
             + String(self.router.route_count())
             + " routes)"
         )
+        print("[MojoFlow] " + String(worker_model))
         print("[MojoFlow] Ready. Press Ctrl+C to stop.")
 
         self._running = True
@@ -868,7 +1115,9 @@ struct Server:
         self._shutdown_requested = False
 
         while self._running:
-            var events = runtime.event_loop.poll(timeout_ms=100)
+            var events = runtime.event_loop.poll(
+                timeout_ms=self.config.event_loop_poll_timeout_ms
+            )
             for i in range(len(events)):
                 var ev = events[i]
                 if ev.fd == listener.fd() and ev.readable and self._accepting:

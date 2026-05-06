@@ -32,6 +32,45 @@ struct App:
     fn listen(self, port: Int) raises
 ```
 
+### `ServerConfig` Observability
+```mojo
+var observability_enabled: Bool      # default: True
+var log_level: String                # "off" | "error" | "warn" | "info" | "debug" | "trace"
+var request_logging_enabled: Bool    # default: True
+var metrics_enabled: Bool            # default: True
+var openapi_enabled: Bool            # default: False
+var openapi_path: String             # default: "/openapi.json"
+```
+
+### `ServerConfig` Scaling
+```mojo
+var worker_threads: Int              # OS workers, default: 1
+var worker_fibers: Int               # Fiber slots per worker
+var max_pending_connections: Int     # bounded backpressure queue
+var accept_batch_size: Int           # accepts drained per readiness event
+var event_loop_poll_timeout_ms: Int  # hot-loop poll timeout
+var max_keep_alive_requests: Int     # requests per keep-alive socket
+var keep_alive_timeout_ms: Int       # idle keep-alive timeout
+fn total_fiber_slots(self) -> Int
+```
+
+### `Server` Observability
+```mojo
+fn metrics_json(self) -> String
+fn openapi_json(self) -> String
+fn queued_connections(self) -> Int
+fn connection_pressure(self) -> Int
+```
+
+### Runtime Scaling
+```mojo
+struct WorkerModel:
+    var worker_threads: Int
+    var fibers_per_worker: Int
+    var max_parallel_workers: Int
+    fn total_fibers(self) -> Int
+```
+
 ### `Request`
 ```mojo
 struct Request:

@@ -77,6 +77,18 @@ serialisation; reduce to 16 KiB if handlers are trivial,
 increase to 256 KiB if handlers recurse deeply.
 Must be page-aligned (4096) on Linux."""
 
+alias DEFAULT_WORKER_THREADS: Int = 1
+"""Number of OS worker threads.  Each owns a Fiber runtime."""
+
+alias DEFAULT_MAX_PENDING_CONNECTIONS: Int = 16_384
+"""Bounded overflow queue used for backpressure before 503 responses."""
+
+alias DEFAULT_ACCEPT_BATCH_SIZE: Int = 256
+"""Max accepted sockets drained per readiness event."""
+
+alias DEFAULT_EVENT_LOOP_POLL_TIMEOUT_MS: Int = 1
+"""Poll timeout for the hot event loop. Low value targets sub-ms wakeups."""
+
 # ── Timeouts (milliseconds) ──────────────────────────────────────
 
 alias DEFAULT_READ_TIMEOUT_MS: Int = 30_000
@@ -139,6 +151,14 @@ port.  Enable for multi-process deployments (one process per core)."""
 
 alias DEFAULT_SERVER_NAME: StringLiteral = "MojoFlow/0.2.0"
 """Value of the `Server` response header."""
+
+# ── Observability ────────────────────────────────────────────────
+
+alias DEFAULT_LOG_LEVEL: StringLiteral = "info"
+"""Request log level. One of off, error, warn, info, debug, trace."""
+
+alias DEFAULT_OPENAPI_PATH: StringLiteral = "/openapi.json"
+"""Built-in OpenAPI document path when OpenAPI generation is enabled."""
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -237,6 +257,10 @@ struct ServerConfig:
     Fields — Fiber / concurrency:
         worker_fibers           Number of Fibers running the request loop.
         fiber_stack_size        Per-Fiber stack allocation in bytes.
+        worker_threads          OS threads, each with its own Fiber runtime.
+        max_pending_connections Backpressure queue cap before 503.
+        accept_batch_size       Accepts drained per listener event.
+        event_loop_poll_timeout_ms Poll timeout for the hot loop.
 
     Fields — Timeouts (milliseconds):
         read_timeout_ms         Complete-request read deadline.
@@ -259,6 +283,14 @@ struct ServerConfig:
     Fields — Identity & debug:
         server_name             `Server` response header value.
         debug                   Verbose logging + error detail in responses.
+
+    Fields — Observability:
+        observability_enabled   Master switch for built-in observability.
+        log_level               Request log level.
+        request_logging_enabled Emit per-request logs.
+        metrics_enabled         Track connection/RPS/latency counters.
+        openapi_enabled         Serve generated OpenAPI JSON.
+        openapi_path            Path for the generated OpenAPI JSON.
 
     Fields — TLS:
         tls_enabled             Master switch for TLS termination (future).
@@ -293,6 +325,10 @@ struct ServerConfig:
     # ── Fiber / concurrency ───────────────────────────────────────
     var worker_fibers: Int
     var fiber_stack_size: Int
+    var worker_threads: Int
+    var max_pending_connections: Int
+    var accept_batch_size: Int
+    var event_loop_poll_timeout_ms: Int
 
     # ── Timeouts (ms) ─────────────────────────────────────────────
     var read_timeout_ms: Int
@@ -316,6 +352,14 @@ struct ServerConfig:
     var server_name: String
     var debug: Bool
 
+    # ── Observability ────────────────────────────────────────────
+    var observability_enabled: Bool
+    var log_level: String
+    var request_logging_enabled: Bool
+    var metrics_enabled: Bool
+    var openapi_enabled: Bool
+    var openapi_path: String
+
     # ── TLS ───────────────────────────────────────────────────────
     var tls_enabled: Bool
     var tls: TLSConfig
@@ -331,6 +375,10 @@ struct ServerConfig:
         self.max_keep_alive_requests = DEFAULT_MAX_KEEP_ALIVE_REQUESTS
         self.worker_fibers = DEFAULT_WORKER_FIBERS
         self.fiber_stack_size = DEFAULT_FIBER_STACK_SIZE
+        self.worker_threads = DEFAULT_WORKER_THREADS
+        self.max_pending_connections = DEFAULT_MAX_PENDING_CONNECTIONS
+        self.accept_batch_size = DEFAULT_ACCEPT_BATCH_SIZE
+        self.event_loop_poll_timeout_ms = DEFAULT_EVENT_LOOP_POLL_TIMEOUT_MS
         self.read_timeout_ms = DEFAULT_READ_TIMEOUT_MS
         self.write_timeout_ms = DEFAULT_WRITE_TIMEOUT_MS
         self.keep_alive_timeout_ms = DEFAULT_KEEP_ALIVE_TIMEOUT_MS
@@ -345,6 +393,12 @@ struct ServerConfig:
         self.reuse_port = DEFAULT_REUSE_PORT
         self.server_name = DEFAULT_SERVER_NAME
         self.debug = False
+        self.observability_enabled = True
+        self.log_level = DEFAULT_LOG_LEVEL
+        self.request_logging_enabled = True
+        self.metrics_enabled = True
+        self.openapi_enabled = False
+        self.openapi_path = DEFAULT_OPENAPI_PATH
         self.tls_enabled = False
         self.tls = TLSConfig()
 
@@ -357,6 +411,10 @@ struct ServerConfig:
         max_keep_alive_requests: Int = DEFAULT_MAX_KEEP_ALIVE_REQUESTS,
         worker_fibers: Int = DEFAULT_WORKER_FIBERS,
         fiber_stack_size: Int = DEFAULT_FIBER_STACK_SIZE,
+        worker_threads: Int = DEFAULT_WORKER_THREADS,
+        max_pending_connections: Int = DEFAULT_MAX_PENDING_CONNECTIONS,
+        accept_batch_size: Int = DEFAULT_ACCEPT_BATCH_SIZE,
+        event_loop_poll_timeout_ms: Int = DEFAULT_EVENT_LOOP_POLL_TIMEOUT_MS,
         read_timeout_ms: Int = DEFAULT_READ_TIMEOUT_MS,
         write_timeout_ms: Int = DEFAULT_WRITE_TIMEOUT_MS,
         keep_alive_timeout_ms: Int = DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
@@ -371,6 +429,12 @@ struct ServerConfig:
         reuse_port: Bool = DEFAULT_REUSE_PORT,
         server_name: String = DEFAULT_SERVER_NAME,
         debug: Bool = False,
+        observability_enabled: Bool = True,
+        log_level: String = DEFAULT_LOG_LEVEL,
+        request_logging_enabled: Bool = True,
+        metrics_enabled: Bool = True,
+        openapi_enabled: Bool = False,
+        openapi_path: String = DEFAULT_OPENAPI_PATH,
         tls_enabled: Bool = False,
         tls: TLSConfig = TLSConfig(),
     ):
@@ -385,6 +449,10 @@ struct ServerConfig:
         self.max_keep_alive_requests = max_keep_alive_requests
         self.worker_fibers = worker_fibers
         self.fiber_stack_size = fiber_stack_size
+        self.worker_threads = worker_threads
+        self.max_pending_connections = max_pending_connections
+        self.accept_batch_size = accept_batch_size
+        self.event_loop_poll_timeout_ms = event_loop_poll_timeout_ms
         self.read_timeout_ms = read_timeout_ms
         self.write_timeout_ms = write_timeout_ms
         self.keep_alive_timeout_ms = keep_alive_timeout_ms
@@ -399,6 +467,12 @@ struct ServerConfig:
         self.reuse_port = reuse_port
         self.server_name = server_name
         self.debug = debug
+        self.observability_enabled = observability_enabled
+        self.log_level = log_level
+        self.request_logging_enabled = request_logging_enabled
+        self.metrics_enabled = metrics_enabled
+        self.openapi_enabled = openapi_enabled
+        self.openapi_path = openapi_path
         self.tls_enabled = tls_enabled
         self.tls = tls
 
@@ -430,6 +504,7 @@ struct ServerConfig:
         return ServerConfig(
             port=port,
             debug=True,
+            log_level="debug",
             shutdown_timeout_ms=1_000,
             keep_alive_timeout_ms=5_000,
         )
@@ -453,6 +528,10 @@ struct ServerConfig:
             host="0.0.0.0",
             backlog=65_535,
             worker_fibers=worker_fibers,
+            worker_threads=4,
+            max_pending_connections=65_536,
+            accept_batch_size=1024,
+            event_loop_poll_timeout_ms=0,
             max_connections=max_connections,
             reuse_port=True,
         )
@@ -470,7 +549,11 @@ struct ServerConfig:
             4 fibers × 64 KiB = 256 KiB (default)
             16 fibers × 64 KiB = 1 MiB (high-concurrency)
         """
-        return self.worker_fibers * self.fiber_stack_size
+        return self.total_fiber_slots() * self.fiber_stack_size
+
+    fn total_fiber_slots(self) -> Int:
+        """Total Fiber slots across every configured OS worker thread."""
+        return self.worker_threads * self.worker_fibers
 
     fn is_tls(self) -> Bool:
         """Whether TLS termination is active."""
@@ -532,6 +615,30 @@ struct ServerConfig:
             raise ServerError.configuration(
                 "fiber_stack_size must be page-aligned (multiple of 4096)",
                 "got " + String(self.fiber_stack_size),
+            ).to_error()
+
+        if self.worker_threads < 1:
+            raise ServerError.configuration(
+                "worker_threads must be ≥ 1",
+                "got " + String(self.worker_threads),
+            ).to_error()
+
+        if self.max_pending_connections < 0:
+            raise ServerError.configuration(
+                "max_pending_connections must be ≥ 0",
+                "got " + String(self.max_pending_connections),
+            ).to_error()
+
+        if self.accept_batch_size < 1:
+            raise ServerError.configuration(
+                "accept_batch_size must be ≥ 1",
+                "got " + String(self.accept_batch_size),
+            ).to_error()
+
+        if self.event_loop_poll_timeout_ms < 0:
+            raise ServerError.configuration(
+                "event_loop_poll_timeout_ms must be ≥ 0",
+                "got " + String(self.event_loop_poll_timeout_ms),
             ).to_error()
 
         # ── Connections ──────────────────────────────────────────
@@ -609,6 +716,18 @@ struct ServerConfig:
                 "got " + String(self.shutdown_timeout_ms),
             ).to_error()
 
+        # ── Observability ────────────────────────────────────────
+        if self.log_level != "off" and self.log_level != "OFF" and self.log_level != "error" and self.log_level != "ERROR" and self.log_level != "warn" and self.log_level != "WARN" and self.log_level != "info" and self.log_level != "INFO" and self.log_level != "debug" and self.log_level != "DEBUG" and self.log_level != "trace" and self.log_level != "TRACE":
+            raise ServerError.configuration(
+                "log_level must be one of off, error, warn, info, debug, trace",
+                "got " + self.log_level,
+            ).to_error()
+
+        if self.openapi_enabled and self.openapi_path == "":
+            raise ServerError.configuration(
+                "openapi_path must not be empty when OpenAPI is enabled"
+            ).to_error()
+
         # ── TLS ──────────────────────────────────────────────────
         if self.tls_enabled:
             self.tls.validate()
@@ -623,6 +742,10 @@ struct ServerConfig:
         s += "  max_conn      = " + String(self.max_connections) + "\n"
         s += "  keep_alive    = " + String(self.max_keep_alive_requests) + " reqs\n"
         s += "  fibers        = " + String(self.worker_fibers) + "\n"
+        s += "  worker_threads= " + String(self.worker_threads) + "\n"
+        s += "  pending_cap   = " + String(self.max_pending_connections) + "\n"
+        s += "  accept_batch  = " + String(self.accept_batch_size) + "\n"
+        s += "  poll_timeout  = " + String(self.event_loop_poll_timeout_ms) + " ms\n"
         s += "  fiber_stack   = " + String(self.fiber_stack_size) + " B\n"
         s += "  read_timeout  = " + String(self.read_timeout_ms) + " ms\n"
         s += "  write_timeout = " + String(self.write_timeout_ms) + " ms\n"
@@ -638,5 +761,9 @@ struct ServerConfig:
         s += "  reuse_port    = " + String(self.reuse_port) + "\n"
         s += "  tls           = " + String(self.tls_enabled) + "\n"
         s += "  debug         = " + String(self.debug) + "\n"
+        s += "  observability = " + String(self.observability_enabled) + "\n"
+        s += "  log_level     = " + self.log_level + "\n"
+        s += "  metrics       = " + String(self.metrics_enabled) + "\n"
+        s += "  openapi       = " + String(self.openapi_enabled) + "\n"
         s += ")"
         return s

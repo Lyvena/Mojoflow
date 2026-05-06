@@ -60,6 +60,7 @@ from .runtime import (
     TaskQueue,
     TaskGroup,
     AsyncRuntime,
+    WorkerModel,
     run_forever,
     spawn_fiber,
     await_all,
@@ -74,8 +75,18 @@ from .handler import (
     MiddlewareDecision,
     MiddlewareStack,
     NoopMiddleware,
+    HandlerResult,
     AsyncRequestHandler,
     handle_connection_async,
+)
+
+# ── Observability ────────────────────────────────────────────────
+from .observability import (
+    LogLevel,
+    LatencyHistogram,
+    ServerMetrics,
+    Observability,
+    monotonic_ms,
 )
 
 # ── HTTP Parser / Serializer ──────────────────────────────────────
@@ -103,6 +114,8 @@ from .server import (
     AsyncFunctionRouteAdapter,
     RouteDecorator,
     ConnectionState,
+    PendingConnectionQueue,
+    ConnectionPool,
     Server,
 )
 
