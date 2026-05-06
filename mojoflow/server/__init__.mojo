@@ -11,6 +11,7 @@ Modules:
     types    — Core HTTP primitives (Request, Response, Headers, …).
     net      — Low-level async networking (sockets, event loop, I/O).
     runtime  — Fiber pool, task queue, and async runtime scheduler.
+    handler  — RequestHandler trait, middleware stack, async pipeline.
     server   — Server, Router, and request handling.
 
 Quick start:
@@ -65,6 +66,18 @@ from .runtime import (
     parallelize_work,
 )
 
+# ── Request Handler Core ─────────────────────────────────────────
+from .handler import (
+    HandlerContext,
+    RequestHandler,
+    AsyncMiddleware,
+    MiddlewareDecision,
+    MiddlewareStack,
+    NoopMiddleware,
+    AsyncRequestHandler,
+    handle_connection_async,
+)
+
 # ── HTTP Parser / Serializer ──────────────────────────────────────
 from .http_parser import (
     ByteView,
@@ -83,6 +96,15 @@ from .server import (
     Route,
     RouteMatch,
     Router,
+    BuiltInRouterHandler,
+    RouteFunction,
+    DecoratedRouterHandler,
+    FunctionRouteAdapter,
+    AsyncFunctionRouteAdapter,
+    RouteDecorator,
     ConnectionState,
     Server,
 )
+
+# ── Compatibility App API ────────────────────────────────────────
+from .http import App

@@ -47,98 +47,29 @@ TODO — future work:
 """
 
 from sys.ffi import external_call
-from memory import UnsafePointer, memset_zero
+from memory import UnsafePointer
 
 from .config import ServerConfig
 from .types import (
     HTTPMethod,
-    HTTPVersion,
     StatusCode,
-    Headers,
     Request,
     Response,
     RouteParam,
 )
-from .errors import ServerError, ErrorKind
+from .net import AsyncListener
+from .runtime import AsyncRuntime, FiberPool
+from .handler import (
+    RequestHandler,
+    HandlerContext,
+    AsyncRequestHandler,
+    MiddlewareStack,
+    NoopMiddleware,
+)
 
-
-# ══════════════════════════════════════════════════════════════════
-#  POSIX Constants & Low-Level Socket Helpers
-# ══════════════════════════════════════════════════════════════════
-
-# Address families
-alias AF_INET: Int32 = 2
-
-# Socket types
-alias SOCK_STREAM: Int32 = 1
-alias SOCK_NONBLOCK: Int32 = 2048
-
-# Socket options
-alias SOL_SOCKET: Int32 = 1
-alias SO_REUSEADDR: Int32 = 2
-alias SO_REUSEPORT: Int32 = 15
-alias IPPROTO_TCP: Int32 = 6
-alias TCP_NODELAY: Int32 = 1
-
-# fcntl
-alias F_GETFL: Int32 = 3
-alias F_SETFL: Int32 = 4
-alias O_NONBLOCK: Int32 = 2048
 
 # recv / send flags
 alias MSG_NOSIGNAL: Int32 = 16384
-
-# epoll (Linux)
-alias EPOLLIN: UInt32 = 0x001
-alias EPOLLOUT: UInt32 = 0x004
-alias EPOLLERR: UInt32 = 0x008
-alias EPOLLHUP: UInt32 = 0x010
-alias EPOLLET: UInt32 = 0x80000000  # edge-triggered
-alias EPOLL_CTL_ADD: Int32 = 1
-alias EPOLL_CTL_DEL: Int32 = 2
-alias EPOLL_CTL_MOD: Int32 = 3
-
-
-@value
-@register_passable("trivial")
-struct SockAddrIn:
-    """POSIX sockaddr_in (IPv4).  16 bytes, packed for FFI."""
-
-    var sin_family: UInt16
-    var sin_port: UInt16
-    var sin_addr: UInt32
-    var _pad: UInt64  # sin_zero[8]
-
-    fn __init__(out self):
-        self.sin_family = 0
-        self.sin_port = 0
-        self.sin_addr = 0
-        self._pad = 0
-
-
-fn _htons(val: UInt16) -> UInt16:
-    """Host-to-network byte order for 16-bit values."""
-    return (val >> 8) | ((val & 0xFF) << 8)
-
-
-fn _inet_aton(ip: String) -> UInt32:
-    """Convert dotted-quad IPv4 string to network-order UInt32.
-
-    Supports "0.0.0.0" and "127.0.0.1" style addresses.
-    Falls back to INADDR_ANY (0) on malformed input.
-    """
-    var parts = ip.split(".")
-    if len(parts) != 4:
-        return 0  # INADDR_ANY
-    try:
-        var a = UInt32(Int(parts[0]))
-        var b = UInt32(Int(parts[1]))
-        var c = UInt32(Int(parts[2]))
-        var d = UInt32(Int(parts[3]))
-        # Network byte order (little-endian host assumed)
-        return a | (b << 8) | (c << 16) | (d << 24)
-    except:
-        return 0
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -165,6 +96,8 @@ struct Route:
     var response_body: String
     var response_status: Int
     var content_type: String
+    var handler_name: String
+    var is_dynamic: Bool
     var _segments: List[String]
     var _is_parameterised: Bool
 
@@ -181,8 +114,27 @@ struct Route:
         self.response_body = response_body
         self.response_status = response_status
         self.content_type = content_type
+        self.handler_name = ""
+        self.is_dynamic = False
         self._segments = pattern.split("/")
         self._is_parameterised = ":" in pattern
+
+    @staticmethod
+    fn dynamic(
+        method: String,
+        pattern: String,
+        handler_name: String,
+    ) -> Route:
+        """Create a route backed by a user function/decorator handler.
+
+        The current built-in Router stores dynamic route metadata.  Actual
+        invocation is handled by DecoratedRouterHandler so the server can keep
+        static string routes and decorated async routes in the same table.
+        """
+        var route = Route(method, pattern, "", 200, "application/json; charset=utf-8")
+        route.handler_name = handler_name
+        route.is_dynamic = True
+        return route
 
     fn matches(self, method: String, path: String) -> Bool:
         """Check whether this route matches a given method + path."""
@@ -323,6 +275,177 @@ struct Router:
         return self._count
 
 
+struct BuiltInRouterHandler(RequestHandler):
+    """RequestHandler adapter for the built-in method + path router."""
+
+    var router: Router
+
+    fn __init__(out self):
+        self.router = Router()
+
+    fn __init__(out self, router: Router):
+        self.router = router
+
+    fn handle(
+        inout self,
+        inout req: Request,
+        inout context: HandlerContext,
+    ) raises -> Response:
+        if req.method.value == HTTPMethod.OPTIONS:
+            var resp = Response("", StatusCode.NO_CONTENT)
+            resp.set_header("Allow", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+            return resp
+
+        var match = self.router.resolve(req.method.value, req.path)
+        if not match.found:
+            return Response.error("Not Found: " + req.path, 404)
+
+        for i in range(len(match.params)):
+            req.add_route_param(match.params[i].key, match.params[i].value)
+
+        var routes = self.router._routes_for(req.method.value)
+        if match.route_index < 0 or match.route_index >= len(routes):
+            return Response.error("Internal routing error", 500)
+
+        var route = routes[match.route_index]
+        if route.is_dynamic:
+            return Response.error(
+                "Dynamic route requires listen_and_serve_decorated()",
+                501,
+            )
+
+        var resp = Response(route.response_body, route.response_status)
+        resp.set_header("Content-Type", route.content_type)
+        resp.set_header("Content-Length", String(len(route.response_body)))
+        return resp
+
+
+trait RouteFunction:
+    """Trait for decorator-registered route handlers.
+
+    AI/UI integrations can implement this trait on small adapter structs that
+    capture LLM clients, agents, UI compilers, or other app state.  The server
+    still sees a normal async RequestHandler-compatible pipeline.
+    """
+
+    fn call(
+        inout self,
+        inout request: Request,
+        inout context: HandlerContext,
+    ) raises -> Response:
+        ...
+
+
+struct DecoratedRouterHandler[F: RouteFunction](RequestHandler):
+    """RequestHandler adapter for one decorator-registered route function.
+
+    This keeps the first implementation conservative: the router owns method
+    + path matching, while the route function owns the user logic.  More
+    sophisticated storage for many heterogeneous handlers can extend this
+    without changing the public decorator shape.
+    """
+
+    var router: Router
+    var route_function: F
+
+    fn __init__(out self, router: Router, route_function: F):
+        self.router = router
+        self.route_function = route_function
+
+    fn handle(
+        inout self,
+        inout req: Request,
+        inout context: HandlerContext,
+    ) raises -> Response:
+        var match = self.router.resolve(req.method.value, req.path)
+        if not match.found:
+            return Response.error("Not Found: " + req.path, 404)
+
+        for i in range(len(match.params)):
+            req.add_route_param(match.params[i].key, match.params[i].value)
+
+        var routes = self.router._routes_for(req.method.value)
+        if match.route_index < 0 or match.route_index >= len(routes):
+            return Response.error("Internal routing error", 500)
+        if not routes[match.route_index].is_dynamic:
+            var static_handler = BuiltInRouterHandler(self.router)
+            return static_handler.handle(req, context)
+
+        return self.route_function.call(req, context)
+
+
+struct FunctionRouteAdapter[
+    handler_fn: fn (Request) raises -> Response
+](RouteFunction):
+    """Adapter for plain `fn(Request) -> Response` route handlers."""
+
+    fn __init__(out self):
+        pass
+
+    fn call(
+        inout self,
+        inout request: Request,
+        inout context: HandlerContext,
+    ) raises -> Response:
+        return handler_fn(request)
+
+
+struct AsyncFunctionRouteAdapter[
+    handler_fn: fn (Request, HandlerContext) raises -> Response
+](RouteFunction):
+    """Adapter for handlers that want the async HandlerContext."""
+
+    fn __init__(out self):
+        pass
+
+    fn call(
+        inout self,
+        inout request: Request,
+        inout context: HandlerContext,
+    ) raises -> Response:
+        return handler_fn(request, context)
+
+
+struct RouteDecorator:
+    """Decorator-style route registrar returned by `server.get("/path")`.
+
+    Usage:
+
+        @server.get("/hello")
+        fn hello(req: Request) raises -> Response:
+            return Response.json('{"hello": true}')
+
+    Direct call form is also supported by the same object:
+
+        server.get("/hello")(hello)
+
+    The registrar keeps route metadata in the Server's built-in Router and
+    returns an adapter that can be passed to `listen_and_serve_with_handler`.
+    """
+
+    var method: String
+    var path: String
+
+    fn __init__(out self, method: String, path: String):
+        self.method = method
+        self.path = path
+
+    fn __call__[
+        handler_fn: fn (Request) raises -> Response
+    ](self) -> FunctionRouteAdapter[handler_fn]:
+        return FunctionRouteAdapter[handler_fn]()
+
+    fn async_handler[
+        handler_fn: fn (Request, HandlerContext) raises -> Response
+    ](self) -> AsyncFunctionRouteAdapter[handler_fn]:
+        """Register a handler that receives HandlerContext.
+
+        This is useful for AI/data-heavy routes that want
+        `context.parallel_for()` or other async server metadata.
+        """
+        return AsyncFunctionRouteAdapter[handler_fn]()
+
+
 # ══════════════════════════════════════════════════════════════════
 #  Connection State
 # ══════════════════════════════════════════════════════════════════
@@ -371,16 +494,13 @@ struct Server:
     with `.get()`, `.post()`, etc., then call `.listen_and_serve()`
     to start accepting connections.
 
-    Concurrency strategy (current — blocking-accept loop):
-        Each accepted connection is handled inline in the accept
-        loop.  This is the MVP path; the design anticipates a
-        Fiber-per-connection upgrade and an epoll event loop.
-
-    Concurrency strategy (planned — Fiber + epoll):
-        1. `epoll_wait` on the listener + all live connections.
-        2. Readable events dispatch a Fiber from the pool.
-        3. Each Fiber reads → parses → routes → writes → recycles.
-        4. Worker Fibers are pinned across cores via MAX `parallelize`.
+    Concurrency strategy:
+        1. AsyncListener binds and exposes a non-blocking listener fd.
+        2. AsyncRuntime/EventLoop polls the listener in a hot loop.
+        3. Every accepted connection is assigned to a FiberPool slot.
+        4. The Fiber runs AsyncRequestHandler: parse, middleware,
+           user handler/router, response write, close.
+        5. Shutdown stops accepting and drains active Fibers.
 
     Example:
         var cfg = ServerConfig(host="0.0.0.0", port=3000)
@@ -390,28 +510,49 @@ struct Server:
         srv.listen_and_serve()
 
     TODO:
-        - Fiber-per-connection dispatch.
-        - epoll / io_uring event loop.
-        - Graceful shutdown (drain + timeout).
-        - Middleware pipeline (pre-request / post-response hooks).
-        - Handler function pointers instead of static response bodies.
+        - Real coroutine/Fiber suspension once Mojo exposes stable Fibers.
+        - io_uring event loop.
+        - Heterogeneous middleware storage once boxed trait objects land.
+        - Function-pointer/closure routes instead of static response bodies.
         - HTTP/2, WebSocket upgrade.
         - Connection-level metrics (bytes in/out, latency histogram).
     """
 
     var config: ServerConfig
     var router: Router
+    var _fiber_pool: FiberPool
     var _running: Bool
+    var _accepting: Bool
+    var _shutdown_requested: Bool
+    var _connections_total: Int
 
     fn __init__(out self):
         self.config = ServerConfig()
         self.router = Router()
+        self._fiber_pool = FiberPool(self.config.worker_fibers)
         self._running = False
+        self._accepting = False
+        self._shutdown_requested = False
+        self._connections_total = 0
 
     fn __init__(out self, config: ServerConfig):
         self.config = config
         self.router = Router()
+        self._fiber_pool = FiberPool(config.worker_fibers)
         self._running = False
+        self._accepting = False
+        self._shutdown_requested = False
+        self._connections_total = 0
+
+    fn __init__(out self, config: ServerConfig, router: Router):
+        """Create a server with an externally prepared built-in router."""
+        self.config = config
+        self.router = router
+        self._fiber_pool = FiberPool(config.worker_fibers)
+        self._running = False
+        self._accepting = False
+        self._shutdown_requested = False
+        self._connections_total = 0
 
     # ── Route registration (sugar) ────────────────────────────────
 
@@ -424,6 +565,15 @@ struct Server:
         """Register a GET route with a static JSON response."""
         self.router.add(Route(HTTPMethod.GET, path, body, status))
 
+    fn get(inout self, path: String) -> RouteDecorator:
+        """Decorator-style GET registration.
+
+        Keeps compatibility with `@server.get("/path")` style APIs while
+        preserving the existing `server.get("/path", body)` static route API.
+        """
+        self.router.add(Route.dynamic(HTTPMethod.GET, path, "decorated"))
+        return RouteDecorator(HTTPMethod.GET, path)
+
     fn post(
         inout self,
         path: String,
@@ -432,6 +582,11 @@ struct Server:
     ):
         """Register a POST route."""
         self.router.add(Route(HTTPMethod.POST, path, body, status))
+
+    fn post(inout self, path: String) -> RouteDecorator:
+        """Decorator-style POST registration."""
+        self.router.add(Route.dynamic(HTTPMethod.POST, path, "decorated"))
+        return RouteDecorator(HTTPMethod.POST, path)
 
     fn put(
         inout self,
@@ -442,6 +597,11 @@ struct Server:
         """Register a PUT route."""
         self.router.add(Route(HTTPMethod.PUT, path, body, status))
 
+    fn put(inout self, path: String) -> RouteDecorator:
+        """Decorator-style PUT registration."""
+        self.router.add(Route.dynamic(HTTPMethod.PUT, path, "decorated"))
+        return RouteDecorator(HTTPMethod.PUT, path)
+
     fn delete(
         inout self,
         path: String,
@@ -451,6 +611,11 @@ struct Server:
         """Register a DELETE route."""
         self.router.add(Route(HTTPMethod.DELETE, path, body, status))
 
+    fn delete(inout self, path: String) -> RouteDecorator:
+        """Decorator-style DELETE registration."""
+        self.router.add(Route.dynamic(HTTPMethod.DELETE, path, "decorated"))
+        return RouteDecorator(HTTPMethod.DELETE, path)
+
     fn patch(
         inout self,
         path: String,
@@ -459,6 +624,11 @@ struct Server:
     ):
         """Register a PATCH route."""
         self.router.add(Route(HTTPMethod.PATCH, path, body, status))
+
+    fn patch(inout self, path: String) -> RouteDecorator:
+        """Decorator-style PATCH registration."""
+        self.router.add(Route.dynamic(HTTPMethod.PATCH, path, "decorated"))
+        return RouteDecorator(HTTPMethod.PATCH, path)
 
     fn route(
         inout self,
@@ -471,6 +641,45 @@ struct Server:
         """Register a route with full control over method, status, and content type."""
         self.router.add(Route(method, path, body, status, content_type))
 
+    fn route(inout self, method: String, path: String) -> RouteDecorator:
+        """Decorator-style registration for any HTTP method."""
+        self.router.add(Route.dynamic(method, path, "decorated"))
+        return RouteDecorator(method, path)
+
+    fn decorate_get[
+        handler_fn: fn (Request) raises -> Response
+    ](inout self, path: String) -> FunctionRouteAdapter[handler_fn]:
+        """Explicit equivalent of `@server.get(path)` for plain handlers."""
+        self.router.add(Route.dynamic(HTTPMethod.GET, path, "decorated"))
+        return FunctionRouteAdapter[handler_fn]()
+
+    fn decorate_post[
+        handler_fn: fn (Request) raises -> Response
+    ](inout self, path: String) -> FunctionRouteAdapter[handler_fn]:
+        """Explicit equivalent of `@server.post(path)` for plain handlers."""
+        self.router.add(Route.dynamic(HTTPMethod.POST, path, "decorated"))
+        return FunctionRouteAdapter[handler_fn]()
+
+    fn decorate_get_async[
+        handler_fn: fn (Request, HandlerContext) raises -> Response
+    ](inout self, path: String) -> AsyncFunctionRouteAdapter[handler_fn]:
+        """Register a GET handler that receives HandlerContext."""
+        self.router.add(Route.dynamic(HTTPMethod.GET, path, "decorated"))
+        return AsyncFunctionRouteAdapter[handler_fn]()
+
+    fn decorate_post_async[
+        handler_fn: fn (Request, HandlerContext) raises -> Response
+    ](inout self, path: String) -> AsyncFunctionRouteAdapter[handler_fn]:
+        """Register a POST handler that receives HandlerContext."""
+        self.router.add(Route.dynamic(HTTPMethod.POST, path, "decorated"))
+        return AsyncFunctionRouteAdapter[handler_fn]()
+
+    fn use_router(inout self, router: Router):
+        """Replace the built-in router before the server starts."""
+        if self._running:
+            return
+        self.router = router
+
     # ── Request handling ──────────────────────────────────────────
 
     fn _handle_request(self, inout req: Request) -> Response:
@@ -480,38 +689,25 @@ struct Server:
         configured response with route parameters populated on
         the Request.
         """
-        # OPTIONS → 204 (minimal CORS preflight support)
-        if req.method.value == HTTPMethod.OPTIONS:
-            var resp = Response("", StatusCode.NO_CONTENT)
-            resp.set_header("Allow", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
-            return resp
-
-        var match = self.router.resolve(req.method.value, req.path)
-        if not match.found:
-            return Response.error("Not Found: " + req.path, 404)
-
-        # Inject extracted route params into the request
-        for i in range(len(match.params)):
-            req.add_route_param(match.params[i].key, match.params[i].value)
-
-        # Look up the route by index
-        var routes = self.router._routes_for(req.method.value)
-        if match.route_index < 0 or match.route_index >= len(routes):
-            return Response.error("Internal routing error", 500)
-
-        var route = routes[match.route_index]
-        var resp = Response(route.response_body, route.response_status)
-        resp.set_header("Content-Type", route.content_type)
-        resp.set_header("Content-Length", String(len(route.response_body)))
-        return resp
+        var handler = BuiltInRouterHandler(self.router)
+        var context = HandlerContext(self.config, -1)
+        return handler.handle(req, context)
 
     # ── Connection handling ───────────────────────────────────────
 
-    fn _handle_connection(self, client_fd: Int32):
+    fn _handle_connection[
+        H: RequestHandler,
+    ](
+        inout self,
+        client_fd: Int32,
+        fiber_id: Int,
+        inout handler: H,
+    ):
         """Read a request from a socket, route it, send the response, close.
 
-        This is the synchronous MVP path.  The Fiber-based path will
-        replace this with non-blocking reads and epoll-driven writes.
+        Uses the shared AsyncRequestHandler pipeline so parsing,
+        middleware, handler/router, MAX context setup, response
+        serialization, and close behavior stay in one place.
 
         TODO:
             - Keep-alive loop (read multiple requests per connection).
@@ -519,71 +715,122 @@ struct Server:
             - Partial read buffering for large requests.
             - Sendfile() for static assets.
         """
-        # ── Read ──────────────────────────────────────────────────
-        var buf_size = self.config.read_buffer_size
-        var buf = UnsafePointer[UInt8].alloc(buf_size)
-        memset_zero(buf, buf_size)
-
-        var n = external_call["recv", Int, Int32, UnsafePointer[UInt8], Int, Int32](
-            client_fd, buf, buf_size - 1, 0
-        )
-
-        if n <= 0:
-            buf.free()
+        var middleware = MiddlewareStack[NoopMiddleware]()
+        var async_handler = AsyncRequestHandler(self.config, fiber_id)
+        try:
+            async_handler.handle_connection[H, NoopMiddleware](
+                client_fd,
+                handler,
+                middleware,
+            )
+        except:
             _ = external_call["close", Int32, Int32](client_fd)
+
+    fn _send_busy(self, client_fd: Int32):
+        """Reject a connection when no Fiber slot is available."""
+        var busy = Response.error("Server Busy", 503)
+        var wire = busy.to_bytes_close()
+        _ = external_call[
+            "send", Int,
+            Int32, UnsafePointer[UInt8], Int, Int32,
+        ](client_fd, wire.unsafe_ptr(), len(wire), MSG_NOSIGNAL)
+        _ = external_call["close", Int32, Int32](client_fd)
+
+    fn _dispatch_connection[
+        H: RequestHandler,
+    ](
+        inout self,
+        client_fd: Int32,
+        inout handler: H,
+    ):
+        """Assign a connection to a FiberPool slot and run its handler."""
+        var fiber = self._fiber_pool.spawn(client_fd)
+        if fiber.id < 0:
+            self._send_busy(client_fd)
             return
 
-        # Build a Mojo String from the raw bytes
-        # TODO: replace with zero-copy StringSlice once stable
-        var raw = String("")
-        for i in range(n):
-            raw += chr(Int(buf[i]))
-        buf.free()
-
-        # ── Parse & Route ─────────────────────────────────────────
-        var resp: Response
+        self._fiber_pool.activate(fiber.id)
         try:
-            var req = Request.parse(raw)
-            resp = self._handle_request(req)
-        except e:
-            resp = Response.error("Bad Request: " + String(e), 400)
+            self._handle_connection[H](client_fd, fiber.id, handler)
+            self._fiber_pool.complete(fiber.id)
+        except:
+            self._fiber_pool.fail(fiber.id)
+            _ = external_call["close", Int32, Int32](client_fd)
 
-        # ── Write ─────────────────────────────────────────────────
-        var wire = resp.to_bytes_close()
-        var wire_ptr = wire.unsafe_ptr()
-        _ = external_call["send", Int, Int32, UnsafePointer[UInt8], Int, Int32](
-            client_fd,
-            wire_ptr,
-            len(wire),
-            MSG_NOSIGNAL,
-        )
+    fn _drain_accepts[
+        H: RequestHandler,
+    ](
+        inout self,
+        inout listener: AsyncListener,
+        inout handler: H,
+    ):
+        """Drain all pending accepts from an edge-triggered listener."""
+        while self._accepting:
+            var client_fd = listener.accept()
+            if client_fd < 0:
+                break
+            self._connections_total += 1
+            self._dispatch_connection[H](client_fd, handler)
 
-        # ── Close ─────────────────────────────────────────────────
-        _ = external_call["close", Int32, Int32](client_fd)
+    fn _drain_fibers(inout self):
+        """Wait for active Fibers to finish after accepting stops."""
+        while self._fiber_pool.active_count() > 0:
+            self._fiber_pool.await_all()
+            break
+
+    fn shutdown(inout self):
+        """Request graceful shutdown.
+
+        The hot loop stops accepting new sockets, drains any active
+        Fiber slots, then exits and lets AsyncListener close its fd.
+        """
+        self._shutdown_requested = True
+        self._accepting = False
+        self._running = False
+
+    fn is_running(self) -> Bool:
+        return self._running
+
+    fn connections_total(self) -> Int:
+        return self._connections_total
+
+    fn active_fibers(self) -> Int:
+        return self._fiber_pool.active_count()
 
     # ── Main listen loop ──────────────────────────────────────────
 
     fn listen_and_serve(inout self) raises:
-        """Bind, listen, and accept connections in a loop.
+        """Serve using the built-in Router as the request handler."""
+        var handler = BuiltInRouterHandler(self.router)
+        self.listen_and_serve_with_handler[BuiltInRouterHandler](handler)
 
-        Current implementation: synchronous accept + handle.
-        Planned: epoll event-loop with Fiber dispatch.
+    fn listen_and_serve_decorated[
+        F: RouteFunction,
+    ](
+        inout self,
+        inout route_function: F,
+    ) raises:
+        """Serve using a decorator-registered route function.
 
-        Lifecycle:
-            1. Validate config.
-            2. Create TCP socket with SO_REUSEADDR, TCP_NODELAY.
-            3. Bind to config.host:config.port.
-            4. Listen with config.backlog.
-            5. Accept loop — one connection at a time (MVP).
-            6. Ctrl-C exits the loop (socket timeout not yet wired).
+        The built-in router still performs method/path matching.  The matched
+        dynamic route delegates to `route_function`, so AI/UI code can expose
+        endpoints by wrapping agents, LLM clients, UI compilers, or plain JSON
+        builders in a RouteFunction.
+        """
+        var handler = DecoratedRouterHandler[F](self.router, route_function)
+        self.listen_and_serve_with_handler[DecoratedRouterHandler[F]](handler)
 
-        TODO:
-            - epoll_create / epoll_ctl / epoll_wait integration.
-            - Fiber pool: spawn a Fiber per accepted fd.
-            - `parallelize(worker_fibers)` across CPU cores.
-            - Graceful shutdown: stop accepting, drain in-flight,
-              wait shutdown_timeout_ms, then force-close.
-            - Signal handler for SIGTERM / SIGINT.
+    fn listen_and_serve_with_handler[
+        H: RequestHandler,
+    ](
+        inout self,
+        inout handler: H,
+    ) raises:
+        """Bind, listen, and serve with a user-provided handler.
+
+        This is the primary server loop.  It binds via AsyncListener,
+        polls via AsyncRuntime's EventLoop, accepts in a hot loop, and
+        dispatches every connection to the FiberPool.
         """
         self.config.validate()
 
@@ -602,67 +849,10 @@ struct Server:
         if self.config.tls_enabled:
             print("[MojoFlow] TLS termination enabled (not yet implemented)")
 
-        # ── Create socket ─────────────────────────────────────────
-        var fd = external_call["socket", Int32, Int32, Int32, Int32](
-            AF_INET, SOCK_STREAM, 0
-        )
-        if fd < 0:
-            raise ServerError.bind("socket() failed").to_error()
-
-        # ── Socket options ────────────────────────────────────────
-        var yes: Int32 = 1
-        var yes_ptr = UnsafePointer[Int32].alloc(1)
-        yes_ptr[] = yes
-
-        if self.config.reuse_address:
-            _ = external_call[
-                "setsockopt", Int32,
-                Int32, Int32, Int32, UnsafePointer[Int32], UInt32,
-            ](fd, SOL_SOCKET, SO_REUSEADDR, yes_ptr, 4)
-
-        if self.config.reuse_port:
-            _ = external_call[
-                "setsockopt", Int32,
-                Int32, Int32, Int32, UnsafePointer[Int32], UInt32,
-            ](fd, SOL_SOCKET, SO_REUSEPORT, yes_ptr, 4)
-
-        if self.config.tcp_nodelay:
-            _ = external_call[
-                "setsockopt", Int32,
-                Int32, Int32, Int32, UnsafePointer[Int32], UInt32,
-            ](fd, IPPROTO_TCP, TCP_NODELAY, yes_ptr, 4)
-
-        yes_ptr.free()
-
-        # ── Bind ──────────────────────────────────────────────────
-        var addr = SockAddrIn()
-        addr.sin_family = UInt16(AF_INET)
-        addr.sin_port = _htons(UInt16(self.config.port))
-        addr.sin_addr = _inet_aton(self.config.host)
-
-        var addr_ptr = UnsafePointer[SockAddrIn].alloc(1)
-        addr_ptr[] = addr
-
-        var bind_result = external_call[
-            "bind", Int32,
-            Int32, UnsafePointer[SockAddrIn], UInt32,
-        ](fd, addr_ptr, 16)
-
-        addr_ptr.free()
-
-        if bind_result < 0:
-            _ = external_call["close", Int32, Int32](fd)
-            raise ServerError.bind(
-                "bind() failed on " + self.config.address()
-            ).to_error()
-
-        # ── Listen ────────────────────────────────────────────────
-        var listen_result = external_call["listen", Int32, Int32, Int32](
-            fd, Int32(self.config.backlog)
-        )
-        if listen_result < 0:
-            _ = external_call["close", Int32, Int32](fd)
-            raise ServerError.bind("listen() failed").to_error()
+        var listener = AsyncListener.start(self.config)
+        var runtime = AsyncRuntime.create(self.config)
+        runtime.register_listener(listener.fd())
+        self._fiber_pool = FiberPool(self.config.worker_fibers)
 
         print(
             "[MojoFlow] Listening on "
@@ -674,34 +864,23 @@ struct Server:
         print("[MojoFlow] Ready. Press Ctrl+C to stop.")
 
         self._running = True
+        self._accepting = True
+        self._shutdown_requested = False
 
-        # ── Accept loop ───────────────────────────────────────────
-        #
-        # MVP: synchronous accept → handle → close.
-        #
-        # TODO: Replace with:
-        #   var epoll_fd = external_call["epoll_create1", Int32, Int32](0)
-        #   register listener fd with EPOLLIN
-        #   loop:
-        #       epoll_wait → for each ready fd:
-        #           if listener → accept → register new fd
-        #           if client   → spawn Fiber(_handle_connection, fd)
-        #
         while self._running:
-            var client_fd = external_call["accept", Int32, Int32, UnsafePointer[UInt8], UnsafePointer[UInt32]](
-                fd,
-                UnsafePointer[UInt8](),
-                UnsafePointer[UInt32](),
-            )
-            if client_fd < 0:
-                # accept() error — may be EINTR from Ctrl-C
+            var events = runtime.event_loop.poll(timeout_ms=100)
+            for i in range(len(events)):
+                var ev = events[i]
+                if ev.fd == listener.fd() and ev.readable and self._accepting:
+                    self._drain_accepts[H](listener, handler)
+                elif ev.error or ev.hangup:
+                    runtime.event_loop.deregister(ev.fd)
+                    _ = external_call["close", Int32, Int32](ev.fd)
+
+            if self._shutdown_requested:
                 self._running = False
-                continue
 
-            # TODO: Dispatch to Fiber pool instead of inline handling.
-            #   Fiber.spawn(self._handle_connection, client_fd)
-            self._handle_connection(client_fd)
-
-        # ── Cleanup ───────────────────────────────────────────────
-        _ = external_call["close", Int32, Int32](fd)
+        self._accepting = False
+        runtime.event_loop.deregister(listener.fd())
+        self._drain_fibers()
         print("[MojoFlow] Server stopped.")

@@ -22,8 +22,12 @@ Static methods: `ok()`, `not_found()`, `internal_error()`, `bad_request()`
 ### `App`
 ```mojo
 struct App:
-    fn get(inout self, path: String, handler: fn(Request) raises -> Response)
-    fn post(inout self, path: String, handler: fn(Request) raises -> Response)
+    fn get(inout self, path: String, body: String, status: Int = 200)
+    fn post(inout self, path: String, body: String, status: Int = 200)
+    fn get(inout self, path: String) -> RouteDecorator
+    fn post(inout self, path: String) -> RouteDecorator
+    fn decorate_get[handler_fn](inout self, path: String)
+    fn decorate_post[handler_fn](inout self, path: String)
     fn use_middleware(inout self, middleware: Middleware)
     fn listen(self, port: Int) raises
 ```
